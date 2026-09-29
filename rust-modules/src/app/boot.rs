@@ -363,160 +363,10 @@ pub(crate) unsafe fn construct(
         initial.home.restore(&mt).map_err(|_| 1)?;
         crate::plex::Client::restore_generation_seed(initial.primary_client).map_err(|_| 1)?;
     }
-    SDL_SetMainReady();
-    // DEAD END, measured 2026-07-31 — do not re-try this. The obvious answer to "a parked TV
-    // should blank itself" is to stop inhibiting the platform screensaver here (and re-allow it
-    // per route, since webOS BACKGROUNDS the app to run one and `0x103` suspends the
-    // buffer-feed, so it could never be on during playback). It does not work, for a reason
-    // upstream of this app: the TV's SDL 2.0.4 fork carries the
-    // `SDL_VIDEO_ALLOW_SCREENSAVER` hint STRING but implements no wayland idle-inhibit
-    // (`strings libSDL2-2.0.so.0` finds no `idle_inhibit`/`suspend_screensaver` symbol), so
-    // this call and `SDL_EnableScreenSaver` are both no-ops. Soaked 34 min on Home with the
-    // TV's own `screenSaverEnabled: on`: no screensaver, no `LIFECYCLE: background`, CPU flat,
-    // our UI still at full brightness on the panel. webOS does not blank a foreground native
-    // app, and nothing reachable from SDL changes that. The line stays because it costs
-    // nothing and states the intent; it is not what keeps the screensaver away.
-    SDL_SetHint(c"SDL_VIDEO_ALLOW_SCREENSAVER".as_ptr(), c"0".as_ptr());
-    if SDL_Init(SDL_INIT_VIDEO) != 0 {
-        log("SDL_Init failed");
-        return Err(1);
-    }
-    {
-        let d = SDL_GetCurrentVideoDriver();
-        if !d.is_null() {
-            log(&format!(
-                "video driver: {}",
-                std::ffi::CStr::from_ptr(d).to_string_lossy()
-            ));
-        }
-    }
-    // The television has a real GLES2 driver (a shim over libmali). macOS has none at all —
-    // Apple ships desktop GL only, capped at 4.1 core — so asking for ES here fails context
-    // creation outright. 4.1 core is the closest thing that exists, and it is a superset for
-    // everything this renderer does: a real VBO (never client arrays) and RGBA/UNSIGNED_BYTE
-    // textures, both core-profile-legal. The shader sources are adapted at compile time by
-    // `gfx::glsl_preamble`, which reads the driver's GLSL version rather than assuming.
-    if cfg!(feature = "hostsim") {
-        SDL_GL_SetAttribute(A_CTX_PROFILE_MASK, CTX_PROFILE_CORE);
-        SDL_GL_SetAttribute(A_CTX_MAJOR, 4);
-        SDL_GL_SetAttribute(A_CTX_MINOR, 1);
-    } else {
-        SDL_GL_SetAttribute(A_CTX_PROFILE_MASK, CTX_PROFILE_ES);
-        SDL_GL_SetAttribute(A_CTX_MAJOR, 2);
-        SDL_GL_SetAttribute(A_CTX_MINOR, 0);
-    }
-    // full 32-bit RGBA so the video plane shows through
-    SDL_GL_SetAttribute(A_RED, 8);
-    SDL_GL_SetAttribute(A_GREEN, 8);
-    SDL_GL_SetAttribute(A_BLUE, 8);
-    SDL_GL_SetAttribute(A_ALPHA, 8);
-    SDL_GL_SetAttribute(A_BUFFER_SIZE, 32);
-    // ...and NO depth or stencil, which SDL would otherwise give us anyway: its defaults are
-    // 16 bits of depth and 0 of stencil, and asking for neither had simply never been written
-    // down. **This renderer has no use for either.** There is no `GL_DEPTH_TEST`, no
-    // `glDepthFunc`, no `glDepthMask` and no `glClear(GL_DEPTH_BUFFER_BIT)` anywhere in the
-    // crate — every screen is painter's-algorithm 2-D, drawn back to front — and the one
-    // scissor user (`gfx::clip_set`) is a scissor, not a stencil.
-    //
-    // On a TILER this is not merely 4 MB of address space. Midgard allocates the depth buffer
-    // per tile alongside colour and, unless the driver proves it dead, RESOLVES it to memory at
-    // end-of-frame: 1920x1080x2 bytes written per presented frame for a buffer nothing ever
-    // reads. `system.rs` logs what the config actually came back with — a request is not a
-    // grant, and the only honest confirmation is `FB bits: … depth=0`.
-    SDL_GL_SetAttribute(A_DEPTH, 0);
-    SDL_GL_SetAttribute(A_STENCIL, 0);
-    // The television is placed at 0,0 at exactly canvas size and takes the panel. A desktop
-    // window is centred (`SDL_WINDOWPOS_CENTERED`) at whatever fits — see `desktop_window_size`.
-    #[cfg(feature = "hostsim")]
-    let (wx, wy, ww_req, wh_req) = {
-        let (w, h) = desktop_window_size();
-        (0x2FFF_0000u32 as c_int, 0x2FFF_0000u32 as c_int, w, h)
-    };
-    #[cfg(not(feature = "hostsim"))]
-    let (wx, wy, ww_req, wh_req) = (0, 0, SCR_W, SCR_H);
-    // The title is furniture a television never draws (no window manager, no decoration) and
-    // the first thing a desktop shows, so the two builds spell it differently: the device keeps
-    // the process-shaped name every log, `pidof` recipe and skill already uses.
-    #[cfg(feature = "hostsim")]
-    let title = c"PlxNative";
-    #[cfg(not(feature = "hostsim"))]
-    let title = c"plxnative";
-    let win = SDL_CreateWindow(title.as_ptr(), wx, wy, ww_req, wh_req, SDL_WINDOW_FLAGS);
-    if win.is_null() {
-        log("CreateWindow failed");
-        return Err(1);
-    }
-    let ctx = SDL_GL_CreateContext(win);
-    if ctx.is_null() {
-        log("GL ctx failed");
-        return Err(1);
-    }
-    crate::surface::probe(win);
-    // vsync on → the frame rate locks to the panel refresh. `/tmp/plxnative-novsync` uncaps it so
-    // `fps=` reports the true GPU render rate. WSLg's X11/GLX swap accepts interval 1 without
-    // blocking, so the software budget in `run` follows the same switch.
-    let vsync_enabled = controlled || !crate::dev::scenarios::novsync_armed();
-    SDL_GL_SetSwapInterval(if vsync_enabled { 1 } else { 0 });
+    let platform = platform(controlled)?;
+    let win = platform.win;
     #[cfg(all(feature = "hostsim", target_os = "linux"))]
-    let wslg_frame_pacing = vsync_enabled
-        && std::env::var_os("WSL_DISTRO_NAME").is_some()
-        && std::env::var("SDL_VIDEODRIVER").as_deref() == Ok("x11");
-    {
-        let r = glGetString(GL_RENDERER);
-        let v = glGetString(GL_VERSION);
-        let renderer = (!r.is_null()).then(|| std::ffi::CStr::from_ptr(r).to_string_lossy());
-        if let (Some(renderer), false) = (&renderer, v.is_null()) {
-            log(&format!("GL: {} / {}", renderer, std::ffi::CStr::from_ptr(v).to_string_lossy()));
-        }
-        // A CPU rasterizer's frame time is not a main-thread hang (`task::runtime_check`).
-        #[cfg(feature = "threadcheck")]
-        crate::task::runtime_check::note_renderer(renderer.as_deref());
-    }
-    // The system on-screen keyboard, PROBED — see `crate::textinput`'s module doc. Both facts
-    // on this line are preconditions that fail in complete silence, and nothing in this tree
-    // had ever read either of them:
-    //   support= `SDL_HasScreenKeyboardSupport` — does this firmware's SDL have a panel at all.
-    //   focus=   `SDL_WINDOW_INPUT_FOCUS` — `SDL_StartTextInput` shows the panel only
-    //            `if (SDL_GetKeyboardFocus())`. Clear, and it enables text events, returns
-    //            void, and no panel appears.
-    //   active=  whether text events are already on. It is 1 on a desktop and 0 here, because
-    //            SDL only auto-starts text input on platforms with NO screen keyboard — which
-    //            is precisely why `textinput` tracks its own started flag instead of this one.
-    // A `focus=0` HERE is not yet a verdict: the flag arrives with the wayland keyboard
-    // `enter`, which needs the event loop below. `textinput::start` logs it again at the
-    // moment the field asks for the panel, which is the reading that decides anything.
-    // What EGL this set has — extension string, swap behaviour, buffer age. One boot-time
-    // read, logged and used for nothing: `docs/egl-partial-update-and-damage.md` is what it
-    // was for. Deliberately NOT a new link dependency; see `egl.rs`'s module doc for why
-    // `-lEGL` would kill the process at exec() on the very firmwares this app runs on.
-    // No platform carve-out: the probe asks EGL nothing unless an EGL context is current on this
-    // thread (`egl::current_with`), which is what makes it safe on a GLX-backed Linux simulator.
-    crate::egl::probe();
-    crate::textinput::bind(win);
-    // …and the same handshake for the ROOT press: `webos::go_home`'s fallback leg minimizes
-    // this window, and the window is created here, a long way from where BACK is decided.
-    crate::webos::bind_window(win);
-    let wflags = SDL_GetWindowFlags(win);
-    log(&format!(
-        "keyboard: support={} active={} focus={} winflags=0x{wflags:x}",
-        SDL_HasScreenKeyboardSupport(),
-        SDL_IsTextInputActive(),
-        i32::from(wflags & SDL_WINDOW_INPUT_FOCUS != 0)
-    ));
-
-    crate::system::sys_grab_wayland(win);
-    // EXPERIMENT (`/tmp/plxnative-opaque`), no-op without the trigger: build the full-surface
-    // wl_region once, so `opaque_route` below can declare the UI plane opaque on every screen
-    // that has nothing behind it. See `system.rs`'s section on it.
-    crate::system::opaque_region_init();
-    crate::gfx::init_gl();
-    crate::text::init_text();
-    crate::gfx::init_image();
-    crate::gfx::init_blur();
-    // One-time libcurl bind + init (main thread) before any threaded HTTPS call. A false here
-    // means this device has no libcurl we can bind, so plex.tv sign-in will not work — the app
-    // still runs, and `net::global_init` has already said so in the event log.
-    let _ = crate::net::global_init();
+    let wslg_frame_pacing = platform.wslg_frame_pacing;
     // Drain whatever the LAST session left behind, on a worker — and **after `global_init`,
     // which is the whole reason this line is here and not beside `telemetry::boot()` 170 lines
     // up.** It was there first, and the end-to-end run showed why that was wrong: the worker
@@ -1403,4 +1253,174 @@ pub(crate) unsafe fn construct(
         }
     }
     Ok(app)
+}
+
+/// Shared native window and renderer bring-up, independent of any data provider.
+pub(crate) struct Platform {
+    pub(crate) win: *mut c_void,
+    #[cfg(all(feature = "hostsim", target_os = "linux"))]
+    pub(crate) wslg_frame_pacing: bool,
+}
+
+/// Initializes SDL, graphics, fonts and HTTP before starting provider workers.
+pub(crate) unsafe fn platform(controlled: bool) -> Result<Platform, c_int> {
+    SDL_SetMainReady();
+    // DEAD END, measured 2026-07-31 — do not re-try this. The obvious answer to "a parked TV
+    // should blank itself" is to stop inhibiting the platform screensaver here (and re-allow it
+    // per route, since webOS BACKGROUNDS the app to run one and `0x103` suspends the
+    // buffer-feed, so it could never be on during playback). It does not work, for a reason
+    // upstream of this app: the TV's SDL 2.0.4 fork carries the
+    // `SDL_VIDEO_ALLOW_SCREENSAVER` hint STRING but implements no wayland idle-inhibit
+    // (`strings libSDL2-2.0.so.0` finds no `idle_inhibit`/`suspend_screensaver` symbol), so
+    // this call and `SDL_EnableScreenSaver` are both no-ops. Soaked 34 min on Home with the
+    // TV's own `screenSaverEnabled: on`: no screensaver, no `LIFECYCLE: background`, CPU flat,
+    // our UI still at full brightness on the panel. webOS does not blank a foreground native
+    // app, and nothing reachable from SDL changes that. The line stays because it costs
+    // nothing and states the intent; it is not what keeps the screensaver away.
+    SDL_SetHint(c"SDL_VIDEO_ALLOW_SCREENSAVER".as_ptr(), c"0".as_ptr());
+    if SDL_Init(SDL_INIT_VIDEO) != 0 {
+        log("SDL_Init failed");
+        return Err(1);
+    }
+    {
+        let d = SDL_GetCurrentVideoDriver();
+        if !d.is_null() {
+            log(&format!(
+                "video driver: {}",
+                std::ffi::CStr::from_ptr(d).to_string_lossy()
+            ));
+        }
+    }
+    // The television has a real GLES2 driver (a shim over libmali). macOS has none at all —
+    // Apple ships desktop GL only, capped at 4.1 core — so asking for ES here fails context
+    // creation outright. 4.1 core is the closest thing that exists, and it is a superset for
+    // everything this renderer does: a real VBO (never client arrays) and RGBA/UNSIGNED_BYTE
+    // textures, both core-profile-legal. The shader sources are adapted at compile time by
+    // `gfx::glsl_preamble`, which reads the driver's GLSL version rather than assuming.
+    if cfg!(feature = "hostsim") {
+        SDL_GL_SetAttribute(A_CTX_PROFILE_MASK, CTX_PROFILE_CORE);
+        SDL_GL_SetAttribute(A_CTX_MAJOR, 4);
+        SDL_GL_SetAttribute(A_CTX_MINOR, 1);
+    } else {
+        SDL_GL_SetAttribute(A_CTX_PROFILE_MASK, CTX_PROFILE_ES);
+        SDL_GL_SetAttribute(A_CTX_MAJOR, 2);
+        SDL_GL_SetAttribute(A_CTX_MINOR, 0);
+    }
+    // full 32-bit RGBA so the video plane shows through
+    SDL_GL_SetAttribute(A_RED, 8);
+    SDL_GL_SetAttribute(A_GREEN, 8);
+    SDL_GL_SetAttribute(A_BLUE, 8);
+    SDL_GL_SetAttribute(A_ALPHA, 8);
+    SDL_GL_SetAttribute(A_BUFFER_SIZE, 32);
+    // ...and NO depth or stencil, which SDL would otherwise give us anyway: its defaults are
+    // 16 bits of depth and 0 of stencil, and asking for neither had simply never been written
+    // down. **This renderer has no use for either.** There is no `GL_DEPTH_TEST`, no
+    // `glDepthFunc`, no `glDepthMask` and no `glClear(GL_DEPTH_BUFFER_BIT)` anywhere in the
+    // crate — every screen is painter's-algorithm 2-D, drawn back to front — and the one
+    // scissor user (`gfx::clip_set`) is a scissor, not a stencil.
+    //
+    // On a TILER this is not merely 4 MB of address space. Midgard allocates the depth buffer
+    // per tile alongside colour and, unless the driver proves it dead, RESOLVES it to memory at
+    // end-of-frame: 1920x1080x2 bytes written per presented frame for a buffer nothing ever
+    // reads. `system.rs` logs what the config actually came back with — a request is not a
+    // grant, and the only honest confirmation is `FB bits: … depth=0`.
+    SDL_GL_SetAttribute(A_DEPTH, 0);
+    SDL_GL_SetAttribute(A_STENCIL, 0);
+    // The television is placed at 0,0 at exactly canvas size and takes the panel. A desktop
+    // window is centred (`SDL_WINDOWPOS_CENTERED`) at whatever fits — see `desktop_window_size`.
+    #[cfg(feature = "hostsim")]
+    let (wx, wy, ww_req, wh_req) = {
+        let (w, h) = desktop_window_size();
+        (0x2FFF_0000u32 as c_int, 0x2FFF_0000u32 as c_int, w, h)
+    };
+    #[cfg(not(feature = "hostsim"))]
+    let (wx, wy, ww_req, wh_req) = (0, 0, SCR_W, SCR_H);
+    // The title is furniture a television never draws (no window manager, no decoration) and
+    // the first thing a desktop shows, so the two builds spell it differently: the device keeps
+    // the process-shaped name every log, `pidof` recipe and skill already uses.
+    #[cfg(feature = "hostsim")]
+    let title = c"StashNative";
+    #[cfg(not(feature = "hostsim"))]
+    let title = c"plxnative";
+    let win = SDL_CreateWindow(title.as_ptr(), wx, wy, ww_req, wh_req, SDL_WINDOW_FLAGS);
+    if win.is_null() {
+        log("CreateWindow failed");
+        return Err(1);
+    }
+    let ctx = SDL_GL_CreateContext(win);
+    if ctx.is_null() {
+        log("GL ctx failed");
+        return Err(1);
+    }
+    crate::surface::probe(win);
+    // vsync on → the frame rate locks to the panel refresh. `/tmp/plxnative-novsync` uncaps it so
+    // `fps=` reports the true GPU render rate. WSLg's X11/GLX swap accepts interval 1 without
+    // blocking, so the software budget in `run` follows the same switch.
+    let vsync_enabled = controlled || !crate::dev::scenarios::novsync_armed();
+    SDL_GL_SetSwapInterval(if vsync_enabled { 1 } else { 0 });
+    #[cfg(all(feature = "hostsim", target_os = "linux"))]
+    let wslg_frame_pacing = vsync_enabled
+        && std::env::var_os("WSL_DISTRO_NAME").is_some()
+        && std::env::var("SDL_VIDEODRIVER").as_deref() == Ok("x11");
+    {
+        let r = glGetString(GL_RENDERER);
+        let v = glGetString(GL_VERSION);
+        let renderer = (!r.is_null()).then(|| std::ffi::CStr::from_ptr(r).to_string_lossy());
+        if let (Some(renderer), false) = (&renderer, v.is_null()) {
+            log(&format!("GL: {} / {}", renderer, std::ffi::CStr::from_ptr(v).to_string_lossy()));
+        }
+        // A CPU rasterizer's frame time is not a main-thread hang (`task::runtime_check`).
+        #[cfg(feature = "threadcheck")]
+        crate::task::runtime_check::note_renderer(renderer.as_deref());
+    }
+    // The system on-screen keyboard, PROBED — see `crate::textinput`'s module doc. Both facts
+    // on this line are preconditions that fail in complete silence, and nothing in this tree
+    // had ever read either of them:
+    //   support= `SDL_HasScreenKeyboardSupport` — does this firmware's SDL have a panel at all.
+    //   focus=   `SDL_WINDOW_INPUT_FOCUS` — `SDL_StartTextInput` shows the panel only
+    //            `if (SDL_GetKeyboardFocus())`. Clear, and it enables text events, returns
+    //            void, and no panel appears.
+    //   active=  whether text events are already on. It is 1 on a desktop and 0 here, because
+    //            SDL only auto-starts text input on platforms with NO screen keyboard — which
+    //            is precisely why `textinput` tracks its own started flag instead of this one.
+    // A `focus=0` HERE is not yet a verdict: the flag arrives with the wayland keyboard
+    // `enter`, which needs the event loop below. `textinput::start` logs it again at the
+    // moment the field asks for the panel, which is the reading that decides anything.
+    // What EGL this set has — extension string, swap behaviour, buffer age. One boot-time
+    // read, logged and used for nothing: `docs/egl-partial-update-and-damage.md` is what it
+    // was for. Deliberately NOT a new link dependency; see `egl.rs`'s module doc for why
+    // `-lEGL` would kill the process at exec() on the very firmwares this app runs on.
+    // No platform carve-out: the probe asks EGL nothing unless an EGL context is current on this
+    // thread (`egl::current_with`), which is what makes it safe on a GLX-backed Linux simulator.
+    crate::egl::probe();
+    crate::textinput::bind(win);
+    // …and the same handshake for the ROOT press: `webos::go_home`'s fallback leg minimizes
+    // this window, and the window is created here, a long way from where BACK is decided.
+    crate::webos::bind_window(win);
+    let wflags = SDL_GetWindowFlags(win);
+    log(&format!(
+        "keyboard: support={} active={} focus={} winflags=0x{wflags:x}",
+        SDL_HasScreenKeyboardSupport(),
+        SDL_IsTextInputActive(),
+        i32::from(wflags & SDL_WINDOW_INPUT_FOCUS != 0)
+    ));
+
+    crate::system::sys_grab_wayland(win);
+    // EXPERIMENT (`/tmp/plxnative-opaque`), no-op without the trigger: build the full-surface
+    // wl_region once, so `opaque_route` below can declare the UI plane opaque on every screen
+    // that has nothing behind it. See `system.rs`'s section on it.
+    crate::system::opaque_region_init();
+    crate::gfx::init_gl();
+    crate::text::init_text();
+    crate::gfx::init_image();
+    crate::gfx::init_blur();
+    // One-time libcurl bind + init (main thread) before any threaded HTTPS call. A false here
+    // means this device has no libcurl we can bind, so plex.tv sign-in will not work — the app
+    // still runs, and `net::global_init` has already said so in the event log.
+    let _ = crate::net::global_init();
+    Ok(Platform {
+        win,
+        #[cfg(all(feature = "hostsim", target_os = "linux"))]
+        wslg_frame_pacing,
+    })
 }

@@ -58,6 +58,8 @@ mod pms;
 mod release_line;
 mod remote; // dev/testing remote-control channel: a FIFO the loop drains into synthetic SDL keys
 mod screens; // the application's OWNED screens (restructure phase 5b): the Settings family on the dispatcher
+pub mod stash;
+mod stash_media;
 mod route; // play_movie route selection (direct-play vs transcode) — step 3
 mod search; // Search data layer: /hubs/search fanned out across every source, merged into typed shelves
 mod sha256; // SHA-256 / HMAC / PBKDF2, hand-written: the offline PIN verifier's hash (no crypto dependency)
@@ -547,9 +549,9 @@ mod private_log_tests {
         }
 
         let mut sink = Sink::default();
-        write_log_line(&mut sink, "install: id=com.beb.plxnative.debug").unwrap();
+        write_log_line(&mut sink, "install: id=com.stashnative.app.debug").unwrap();
         assert_eq!(sink.calls, 1);
-        assert_eq!(sink.bytes, b"install: id=com.beb.plxnative.debug\n");
+        assert_eq!(sink.bytes, b"install: id=com.stashnative.app.debug\n");
     }
 }
 

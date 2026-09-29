@@ -35,7 +35,11 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=build_support/catalog.rs");
     println!("cargo:rerun-if-changed=../locales");
-    catalog::build(std::path::Path::new("../locales"), &std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap())).expect("valid, complete localization catalogs");
+    catalog::build(
+        std::path::Path::new("../locales"),
+        &std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()),
+    )
+    .expect("valid, complete localization catalogs");
 
     emit_install_identities();
     emit_version();
@@ -85,6 +89,39 @@ fn main() {
     }
 
     compile_svg();
+    compile_stash_preview();
+}
+
+/// The simulator builds the bundled host FFmpeg first. Fast unit checks can run without it;
+/// their disabled decoder still exercises lifecycle and accounting logic.
+fn compile_stash_preview() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let include = repo.join("vendor/ffmpeg-prefix-host/include");
+    let header = include.join("libavformat/avformat.h");
+    println!("cargo:rerun-if-changed={}", header.display());
+    let native = header.exists();
+    let src = repo.join(if native {
+        "src/stash_preview.c"
+    } else {
+        "src/stash_preview_stub.c"
+    });
+    println!("cargo:rerun-if-changed={}", src.display());
+    println!("cargo:rerun-if-changed=../src/stash_preview.h");
+    if !native {
+        println!("cargo:warning=card decoder disabled for this host check; make sim-linux/sim-macos builds bundled FFmpeg");
+    }
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("stash_preview.o");
+    let status = Command::new(std::env::var("CC").unwrap_or_else(|_| "cc".into()))
+        .args(["-c", "-O2", "-fPIC", "-Wall", "-Wextra", "-Werror"])
+        .arg(&src)
+        .arg("-I")
+        .arg(include)
+        .arg("-o")
+        .arg(&out)
+        .status()
+        .expect("compile card decoder");
+    assert!(status.success(), "card decoder compilation failed");
+    println!("cargo:rustc-link-arg={}", out.display());
 }
 
 /// Publish `PLX_VERSION` — the version this build REPORTS, which is not always the version it was

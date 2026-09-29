@@ -38,6 +38,9 @@
 //! the same way; see `dev::scenarios`'s own module doc for the full inventory.
 use super::*;
 
+// Both application bundles share the privileged OS seams through the frame coordinator.
+pub(super) fn platform_pump() { crate::system::ls2_pump(); }
+
 /// One lazy product frame-tail hash path for recording and replay grading alike.
 pub(super) fn recorder_end_frame(
     rec: &mut super::recorder::Recplay,

@@ -675,7 +675,7 @@ impl crate::storage::keymanager::Rpc for Db8 {
                 next["_rev"] = serde_json::json!(self.puts);
                 self.record = Some(next);
                 Ok(
-                    serde_json::json!({"returnValue":true,"results":[{"id":"plxstate.stable","rev":self.puts}]}),
+                    serde_json::json!({"returnValue":true,"results":[{"id":"stash.stable","rev":self.puts}]}),
                 )
             }
             _ => panic!("ACL-tier scenario must not bypass DB8 or invoke a Keymanager RPC"),
@@ -688,7 +688,7 @@ fn production_client_coordinator_and_helper_backend_reconcile_committed_lost_rep
     let mut backend = crate::storage::backend::Backend::new(
         Db8::default(),
         state::Flavor::Stable,
-        "com.beb.plxnative.storage".into(),
+        "com.stashnative.app.storage".into(),
     );
     let session = fixture();
     let mut lose_reply = true;
@@ -766,7 +766,7 @@ fn production_client_coordinator_and_helper_backend_reconcile_committed_lost_rep
 #[test]
 fn helper_signout_retains_the_language_and_only_the_delete_all_reset_removes_it() {
     let mut backend = crate::storage::backend::Backend::new(
-        Db8::default(), state::Flavor::Stable, "com.beb.plxnative.storage".into());
+        Db8::default(), state::Flavor::Stable, "com.stashnative.app.storage".into());
     let mut transport = |request: Request| Ok(backend.dispatch(request));
     let session = Session { language: crate::i18n::Preference::Be, ..fixture() };
     assert!(matches!(
@@ -882,7 +882,7 @@ fn check_v1_extension_bootstrap_roundtrip(keys: &[String]) {
     let mut backend = crate::storage::backend::Backend::new(
         Db8::default(),
         state::Flavor::Stable,
-        "com.beb.plxnative.storage".into(),
+        "com.stashnative.app.storage".into(),
     );
     let mut transport = |request| Ok(backend.dispatch(request));
     assert!(matches!(
@@ -982,7 +982,7 @@ fn helper_migration_keeps_opened_session_typed_through_exact_readback() {
     let mut backend = crate::storage::backend::Backend::new(
         Db8::default(),
         state::Flavor::Stable,
-        "com.beb.plxnative.storage".into(),
+        "com.stashnative.app.storage".into(),
     );
     let mut transport = |request| Ok(backend.dispatch(request));
     let result = persistence::bootstrap_with(
@@ -1063,7 +1063,7 @@ mod published_06 {
         crate::storage::backend::Backend::new(
             Db8 { record, ..Default::default() },
             state::Flavor::Stable,
-            "com.beb.plxnative.storage".into(),
+            "com.stashnative.app.storage".into(),
         )
     }
 
@@ -1115,10 +1115,14 @@ mod published_06 {
 
     #[test]
     fn a_066_db8_record_opens_with_its_session_and_settings_without_writing() {
-        let record: Value = serde_json::from_str(include_str!(
+        // Preserve the published fixture bytes; this test exercises its state encoding inside
+        // Stash's isolated namespace, rather than allowing production to read Plex's DB8 kind.
+        let fixture = include_str!(
             "../../../../tests/fixtures/persistence/generated/v0.6.6-db8-record.json"
-        ))
-        .unwrap();
+        )
+        .replace("plxstate.stable", state::Flavor::Stable.object_id())
+        .replace("com.beb.plxnative.storage:1", "com.stashnative.app.storage:1");
+        let record: Value = serde_json::from_str(&fixture).unwrap();
         let mut backend = helper(Some(record));
         let session = opened("0.6.6 DB8", boot(&mut backend, &mut opener(), &[]));
         assert_carried(
@@ -1167,7 +1171,7 @@ fn fallback_written_file_migrates_into_recovered_missing_db8() {
     let mut backend = crate::storage::backend::Backend::new(
         Db8::default(),
         state::Flavor::Stable,
-        "com.beb.plxnative.storage".into(),
+        "com.stashnative.app.storage".into(),
     );
     let mut transport = |request| Ok(backend.dispatch(request));
     let result = persistence::bootstrap_with(

@@ -26,6 +26,7 @@
 #include <libavutil/channel_layout.h>
 #include <libavutil/dovi_meta.h>
 #include <libavutil/dict.h>
+#include <libswscale/swscale.h>
 
 #define SAME(expr, want, what) _Static_assert((expr) == (want), what)
 
@@ -61,6 +62,7 @@
 SAME(LIBAVFORMAT_VERSION_MAJOR, 63, "bundled libavformat is not 63 — ff.rs's table is for 9.0");
 SAME(LIBAVCODEC_VERSION_MAJOR, 63, "bundled libavcodec is not 63");
 SAME(LIBAVUTIL_VERSION_MAJOR, 61, "bundled libavutil is not 61");
+SAME(LIBSWSCALE_VERSION_MAJOR, 10, "Stash preview conversion requires bundled libswscale 10");
 
 /* --- AVStream: read by offset. NB index is +4, not +0: FFmpeg 5.0 put av_class first. --- */
 SAME32(offsetof(AVStream, index), 4, "OFF_STREAM_INDEX != 4");

@@ -1069,19 +1069,19 @@ _stamp = ROOT / "pkg/.build-config"
 STAMP_TEXT = _stamp.read_text() if _stamp.exists() else ""
 BUILD = build_configuration(STAMP_TEXT)
 
-# THIRD-PARTY-NOTICES must name exactly the libraries that ship. RELEASE=1 drops swscale, and the
-# notices claimed it for two releases — an LGPL document describing a file that is not in the box.
+# THIRD-PARTY-NOTICES must name exactly the libraries that ship. Card previews require swscale
+# in development and release builds; the dev-only set is currently empty.
 #
 # The grade is against the DISTRIBUTED set, which is not what `pkg/` holds: `ci.yml` packages a DEV
 # build deliberately (a PR artifact you can sideload with the /tmp trigger surface on) and a dev
-# build stages one library more. Grading pkg/ verbatim against a document written for the release
+# build used to stage one library more. Grading pkg/ verbatim against a document written for the release
 # payload is what turned every push to main red from 2026-08-10 to 2026-08-12 — the notices were
 # corrected and the gate added in the same commit, and only the release job ever built the
 # configuration the pair describes. Subtracting the dev-only set keeps ONE rule for both
 # configurations, with no build-flag sniffing: a new library still has to be documented, and a
 # documented one that stopped shipping still fails. Whether a RELEASE build really dropped them is
 # the separate, narrower check below.
-DEV_ONLY_SONAMES = {"libswscale-plx.so.10"}   # the dev capture stream's scaler; RELEASE=1 drops it
+DEV_ONLY_SONAMES: set[str] = set()  # card previews require swscale in every flavor
 shipped = {p.name for p in (ROOT / "pkg").glob("*.so.*")
            if p.is_file() and p.read_bytes()[:4] == b"\x7fELF"}
 if shipped:
@@ -1128,7 +1128,7 @@ check(binary.exists(), f"the staged payload carries the binary ({binary.name})")
 # THE ID IS THE RULE, and it is graded whatever the stamp says — note the `if IS_STABLE`
 # below sits BESIDE the `BUILD` branch, never inside it.
 #
-# `com.beb.plxnative` is what a user installs, so a dev-featured binary under it ships the whole
+# `com.stashnative.app` is what a user installs, so a dev-featured binary under it ships the whole
 # /tmp trigger surface, the world-writable `plxnative-remote` FIFO and the `:8910` listener to the
 # public. The Makefile's `release-guard` refuses to BUILD that; this is the same rule on the bytes,
 # which is the half that survives someone reaching for the documented `ALLOW_DEV_ON_STABLE=1`
@@ -1299,8 +1299,8 @@ elif sha_file.exists():
 
 # The Makefile derives IPK_VERSION from appinfo.json, so the built filename is the fourth witness.
 # Scoped to THIS flavour's id: two flavours' artifacts can sit in pkg/ side by side, and the
-# `_arm.ipk` suffix in the pattern is what keeps `com.beb.plxnative_*` from also matching
-# `com.beb.plxnative.debug_*` (the dot is not a `_`, but a bare prefix test would still match).
+# `_arm.ipk` suffix in the pattern is what keeps `com.stashnative.app_*` from also matching
+# `com.stashnative.app.debug_*` (the dot is not a `_`, but a bare prefix test would still match).
 built = sorted((ROOT / "pkg").glob(f"{PACKAGED_ID}_*_arm.ipk"))
 if built:
     check(len(built) == 1, f"exactly one built {PACKAGED_ID} ipk in pkg/ (saw {[p.name for p in built]})")

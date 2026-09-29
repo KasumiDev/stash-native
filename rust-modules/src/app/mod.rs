@@ -131,6 +131,7 @@ pub(crate) mod bridge;
 pub(crate) mod chrome;
 pub(crate) mod content;
 pub(crate) mod run;
+pub(crate) mod stash;
 use self::boot::*;
 use self::events::*;
 use self::lifecycle::*;
@@ -542,6 +543,9 @@ fn enter_application(pms_host: *const c_char, pms_port: c_int) -> Result<App,c_i
 /// The ten-line public skeleton: preflight/construction, then the ordinary loop and teardown.
 #[no_mangle]
 pub extern "C" fn plex_run(pms_host: *const c_char, pms_port: c_int) -> c_int {
+    if !cfg!(test) {
+        return stash::run();
+    }
     let mut app = match enter_application(pms_host,pms_port) { Ok(app) => app, Err(code) => return code };
     unsafe { run_and_shutdown(&mut app) }
 }

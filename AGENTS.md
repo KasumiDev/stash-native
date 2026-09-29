@@ -2,13 +2,13 @@
 
 ## Project
 
-PlxNative is a production-quality native Plex client for rooted LG webOS 4.5 TVs. Most of the
+StashNative is a native Stash client adapted from PlxNative, targeting rooted LG webOS 4.4.0. Most of the
 application is Rust under `rust-modules/src/`; `src/main.c` is the boot/crash shim,
 `src/starfish.c` is the StarfishMediaAPIs/ACB seam, and `src/svg.c` rasterizes SVGs. Keep changes
 properly factored and finished; "only a demo" is never a reason to leave a shortcut behind.
 
 The target is a cross-compiled 32-bit ARM application with a hardware video plane. Host tests and
-the macOS simulator are valuable, but they cannot prove every device behavior.
+the macOS and Windows/WSLg simulators are valuable, but they cannot prove every device behavior.
 
 ## Load the right context
 

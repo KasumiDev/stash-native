@@ -346,6 +346,8 @@ pub(crate) struct PlaybackSession {
     /// machine still owns the engine, this says what the session may write. See
     /// [`preview_request`].
     resolved_as_preview: bool,
+    /// Provider identity is separate from Plex rating keys and never enables Plex writes.
+    stash_scene_id: Option<String>,
 }
 
 /// What the server actually did with a requested Plex Pass audio enhancement (issue #266) — as
@@ -423,6 +425,7 @@ impl PlaybackSession {
         now_ms: 0,
         preview: false,
         resolved_as_preview: false,
+        stash_scene_id: None,
     };
 }
 
@@ -491,6 +494,7 @@ impl PlaybackSession {
             queue: _,
             preview: _,
             resolved_as_preview,
+            stash_scene_id,
         } = self;
         PlaybackSession {
             direct_play_mode: *direct_play_mode,
@@ -541,6 +545,7 @@ impl PlaybackSession {
             // A screen copy is not the live preview. The loop reads the real session.
             preview: false,
             resolved_as_preview: *resolved_as_preview,
+            stash_scene_id: stash_scene_id.clone(),
         }
     }
 }
@@ -610,6 +615,19 @@ pub(crate) fn set_url(ps: &mut PlaybackSession, s: &str) {
 pub(crate) fn clear_url(ps: &mut PlaybackSession) {
     ps.url.clear()
 }
+
+/// URL-fed Stash playback owns no Plex identity or server resources. The native route reducer
+/// still owns the Load transaction, and history is supplied by stash_media::Playback.
+pub(crate) fn prepare_stash_stream(ps: &mut PlaybackSession, scene_id:&str, url: &str, vc: &str, ac: &str, width:u16,height:u16) -> bool {
+    *ps = PlaybackSession::default();
+    ps.stash_scene_id=Some(scene_id.to_owned());
+    if !set_stream_declaration(ps,vc,ac,0.0,crate::metadata::Dovi::NONE,false) { return false; }
+    set_stream_source_raster(ps,width,height);
+    set_url(ps,url);
+    install_active_encoder("");
+    prepare_playback_landing(ps,true).is_some()
+}
+pub(crate) fn stash_owned(ps:&PlaybackSession)->bool {ps.stash_scene_id.is_some()}
 pub(crate) fn transcode_session(ps: &PlaybackSession) -> String {
     ps.tsession.clone()
 }
@@ -4616,7 +4634,7 @@ pub(crate) fn scrobble_stop(
     final_report: Option<(String, i64, i64)>,
     report_th: Option<std::thread::JoinHandle<()>>,
 ) {
-    if preview_request(ps) {
+    if preview_request(ps) || stash_owned(ps) {
         return;
     }
     let (logical_session, pq, pqi) = (sess(ps), pq_id(ps), pq_item_id(ps));
@@ -6589,6 +6607,7 @@ fn apply_plan(ps: &mut PlaybackSession, meta: &mut crate::stores::metadata::Meta
             now_ms,
             preview,
             resolved_as_preview: preview,
+            stash_scene_id: None,
         };
     } };
     if let (crate::plex::TranscodeDelivery::FixedHls { .. }, Some(rung)) = (
@@ -7649,7 +7668,7 @@ pub(crate) fn commit_subtitle_selection(
 /// projection under one lock without touching main-thread-only `Session`.
 pub(crate) fn begin_timeline_reporting(ps: &PlaybackSession) -> Option<TimelineLease> {
     // A trailer never writes watch state, whatever became of its preview flag.
-    if preview_request(ps) {
+    if preview_request(ps) || stash_owned(ps) {
         return None;
     }
     let projection = TimelineProjection {

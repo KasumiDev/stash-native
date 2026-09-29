@@ -98,7 +98,7 @@ pub(crate) fn seed_dev_track_names() {
         audio.len(),
         subs.len()
     ));
-    *SHARED.track_names.lock().unwrap() = TrackNames { audio, subs };
+    *SHARED.track_names.lock().unwrap() = TrackNames { audio, audio_codecs: Vec::new(), subs };
 }
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_long, c_uint};
@@ -517,6 +517,9 @@ pub(crate) fn loading(ps: &crate::route::PlaybackSession) -> bool {
 /// inside one second — a false PASS on `min_timeline_climb_s`.
 pub(crate) fn is_playing(ps: &crate::route::PlaybackSession) -> bool {
     matches!(state(ps), shared::PlaybackState::Playing)
+}
+pub(crate) fn has_error(ps: &crate::route::PlaybackSession) -> bool {
+    matches!(state(ps), shared::PlaybackState::Error)
 }
 /// The derived playback state — the ONE thing the HUD renders from. See `PlaybackState`.
 pub(crate) fn state(ps: &crate::route::PlaybackSession) -> shared::PlaybackState {

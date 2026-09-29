@@ -9,6 +9,8 @@ description: >
 
 # ui-sim — verify UI work on a desktop, finish on the TV
 
+> StashNative uses the dedicated Stash runtime. Use the Windows/WSLg section below and `docs/stashnative-setup.md` for current connection and route checks. Retained Plex, PMS-token, QR sign-in, roster, and full-playback clock-sink recipes describe the upstream application and are historical; they do not verify StashNative.
+
 
 > **This is also what you do while the television is locked.** One set, one lane at a time
 > (`tools/tv-lock.sh`, the **`tv-lock`** skill): when a device command is refused because another
@@ -16,7 +18,7 @@ description: >
 > once, each with its own `PLXNATIVE_RUNTIME_DIR`. Come back to the TV only for what the simulator
 > provably cannot answer (frame rate, text rasterization, LG's decoder, the video plane) — a
 > shorter list on macOS since the streaming pipeline moved onto that simulator on 2026-08-28.
-> Windows/WSLg's UI-only path stops at the existing host no-video seam.
+> Windows/WSLg supports bundled software card previews; full hardware playback still needs the TV.
 
 `plxnative-sim` is the same application core the television runs, linked against desktop SDL2 and
 desktop GL. It draws the real interface against your real Plex Media Server on macOS or through
@@ -41,31 +43,29 @@ The historical `sim`, `sim-token`, `sim-shot`, and `sim-run` names remain macOS 
 
 ### Windows 11 through WSLg
 
-The Windows entry point is `tools/sim.ps1`. It builds an optimized UI/Plex simulator inside the
+The Windows entry point is `tools/sim.ps1`. It builds an optimized Stash simulator inside the
 existing Ubuntu 22.04 WSL distribution, keeps Cargo output and runtime state on WSL's Linux
 filesystem, and opens the SDL/OpenGL window through WSLg:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools/sim.ps1 setup
 powershell -ExecutionPolicy Bypass -File tools/sim.ps1 run
-powershell -ExecutionPolicy Bypass -File tools/sim.ps1 run -StageToken
+powershell -ExecutionPolicy Bypass -File tools/sim.ps1 run -ConfigPath .\.stash.local.json
 powershell -ExecutionPolicy Bypass -File tools/sim.ps1 shot -Output .\shot.png
 powershell -ExecutionPolicy Bypass -File tools/sim.ps1 send right ok shot
 ```
 
-`setup` installs stable Rust, SDL2/SDL2_ttf, Mesa OpenGL and diagnostics in WSL and refuses a
+`setup` installs stable and nightly Rust, SDL2/SDL2_ttf, Mesa OpenGL and diagnostics in WSL and refuses a
 software renderer. `run` and `shot` default to a 1920×1080 drawable, request vsync, and apply a
 60 Hz host frame cap because WSLg's X11/GLX swap does not block on that request. They use
-`~/.cache/plxnative-sim/target`, `~/.local/state/plxnative-sim`, and an isolated asset directory;
+`~/.cache/stashnative-sim/target`, `~/.local/state/stashnative-sim`, and an isolated asset directory;
 override those with `-TargetDir`, `-RuntimeDir`, and `-AssetDir`; quoted paths containing spaces are
 supported. These three overrides are absolute Linux paths inside WSL, keeping Cargo and runtime
-files off the Windows-mounted checkout. `-StageToken` copies the token from gitignored
-`src/config.local.h` without printing it.
-The staged token persists in that runtime directory, so use a fresh `-RuntimeDir` for QR sign-in
-after staging one. `-PmsHost` overrides the header's PMS host.
+files off the Windows-mounted checkout. `-ConfigPath` stages a private Stash JSON configuration without printing credentials.
+Saved Stash settings persist under runtime/state. Use a fresh `-RuntimeDir` for first-run settings; `-ServerUrl` overrides the saved server URL.
 
 This path deliberately calls `make sim-wsl`, the Windows-facing compatibility alias for the native
-Linux `make sim-linux` target. Both skip bundled host FFmpeg. UI, sign-in, Plex browsing,
+Linux `make sim-linux` target. Both build bundled host FFmpeg for card previews. Settings, Stash browsing,
 screenshots and remote commands work; playback reaches the existing host "no video path" result.
 Use macOS `make sim-macos` when the demux/clock-sink simulation is required.
 
@@ -130,8 +130,8 @@ point of the simulator is that it needs neither.
 
 ### What a second Mac needs
 
-On Windows, run `tools/sim.ps1 setup`; use `-PmsHost` for an explicit server and `-StageToken`
-when credentials should be copied from `src/config.local.h`.
+On Windows, run `tools/sim.ps1 setup`; use `-ServerUrl` for an explicit server and `-ConfigPath`
+to stage a private Stash JSON file such as `.stash.local.json`.
 
 Three things, and notably no webOS NDK and no nightly:
 
@@ -321,7 +321,7 @@ Report these ONLY from the device, via the **`tv-session`** skill (and `wake-tv`
   and the decoder — both AVIO transports, the HLS demux, the AU queues and their byte-cap
   backpressure, the feed-ahead throttle, the ABR controller's rung transactions, seek and PTS
   rebase. A 30 s host run against `tests/serve_fixtures.py` produces `abr:` lines and rung commits.
-  **Nothing decodes**, every heartbeat still carries `sim=1`, and no number taken here is a device
+  **Full-playback clock-sink simulation does not decode**, every heartbeat still carries `sim=1`, and no number taken here is a device
   measurement.
 - **The video plane and UI transparency.** The wayland non-opaque trick is webOS-only.
 - ~~**plex.tv sign-in.**~~ **This one is FIXED as of 2026-08-16 and is no longer a limitation.**

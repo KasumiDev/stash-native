@@ -626,18 +626,21 @@ unsafe fn stream_name(s: *mut AVStream) -> String {
 /// too, and both ordinal helpers skip the SIDECAR streams that exist only on the server — which is
 /// exactly the set that is not in this file. So position N here and position N there name one
 /// track, and a file with no tags simply yields empty strings in the right slots.
-unsafe fn track_names(fmt: *mut AVFormatContext) -> (Vec<String>, Vec<String>) {
-    let (mut audio, mut subs) = (Vec::new(), Vec::new());
+unsafe fn track_names(fmt: *mut AVFormatContext) -> (Vec<String>, Vec<String>,Vec<String>) {
+    let (mut audio, mut subs,mut audio_codecs) = (Vec::new(), Vec::new(),Vec::new());
     let streams = (*fmt).streams;
     for i in 0..(*fmt).nb_streams {
         let st = *streams.add(i as usize);
         match (*stream_codecpar(st)).codec_type {
-            AVMEDIA_TYPE_AUDIO => audio.push(stream_name(st)),
+            AVMEDIA_TYPE_AUDIO => {audio.push(stream_name(st));
+                let name=avcodec_get_name((*stream_codecpar(st)).codec_id);
+                audio_codecs.push(if name.is_null(){String::new()}else{std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned()});
+            },
             AVMEDIA_TYPE_SUBTITLE => subs.push(stream_name(st)),
             _ => {}
         }
     }
-    (audio, subs)
+    (audio, subs,audio_codecs)
 }
 
 #[inline]
@@ -1461,18 +1464,15 @@ fn load_libraries() -> bool {
             }
         }
     }
-    // swscale is NOT required, and treating it as required broke the RELEASE build entirely:
-    // `RELEASE=1` drops it from the package (only the dev capture stream's RGBA->YUV conversion
-    // uses it), so an all-or-nothing loop over four libraries would have found three, reported
-    // failure, and refused to play anything — in the configuration users actually receive, and in
-    // no configuration ever tested here.
+    // Stash previews use swscale in every package, including the shipping feature set. Missing
+    // conversion disables software card previews; full hardware playback remains independent.
     match swscale::load(dir) {
         crate::dynlib::Loaded::Ok(soname) => {
             SWS_OK.store(true, Ordering::Relaxed);
             crate::log(&format!("ff: bound swscale -> {soname}"));
         }
         _ => {
-            crate::log("ff: no swscale (expected in a RELEASE build) — dev capture JPEG/MPEG1 off")
+            crate::log("ff: no swscale — software previews and capture conversion unavailable")
         }
     }
     ok
@@ -7945,7 +7945,7 @@ pub(crate) fn demux(
                 // a video stream. See `stream_name` for why they are read at all — for an MP4 they are
                 // the ONLY place a track's identity exists, PMS having dropped it.
                 {
-                    let (audio, subs) = track_names(fmt);
+                    let (audio, subs,audio_codecs) = track_names(fmt);
                     let named = audio
                         .iter()
                         .chain(subs.iter())
@@ -7959,7 +7959,7 @@ pub(crate) fn demux(
                             subs.len()
                         ));
                     }
-                    *SHARED.track_names.lock().unwrap() = crate::player::TrackNames { audio, subs };
+                    *SHARED.track_names.lock().unwrap() = crate::player::TrackNames { audio, subs,audio_codecs };
                 }
                 let vi =
                     av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, std::ptr::null_mut(), 0);

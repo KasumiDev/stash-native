@@ -686,12 +686,14 @@ fi
 # them, permanently", which is a rule and not a migration.
 sib_bad=0
 while IFS= read -r f; do
+  # Each application bundle's registry owns mounting, so it may name its screens.
   [ "$f" = "$SRC/screens/registry.rs" ] && continue
+  [ "$f" = "$SRC/screens/stash_registry.rs" ] && continue
   rel="${f#"$SRC"/screens/}"
   own="${rel%%/*}"
   own="${own%.rs}"
   hits=$(grep_code 'crate::screens::[a-z_]+' "$f" | grep -oE 'crate::screens::[a-z_]+' | sort -u \
-    | grep -vE "^crate::screens::(registry|${own})$" || true)
+    | grep -vE "^crate::screens::(registry|stash_registry|${own})$" || true)
   [ -z "$hits" ] && continue
   if ! allowed sibling-migration "$f"; then
     echo "    $f: $(echo "$hits" | tr '\n' ' ')"

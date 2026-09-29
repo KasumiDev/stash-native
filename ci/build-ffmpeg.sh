@@ -83,7 +83,7 @@ HOST=${HOST:-}
 #
 # So it lives under $PLX_BUILD_CACHE (default ~/.cache/plxnative), machine-wide, KEYED BY THE
 # CONFIGURE FLAGS. The key is the half that makes sharing safe, and it is precisely what the
-# manual `ln -s` workaround in fleet-plan could not express: RELEASE=1 drops swscale and the
+# manual `ln -s` workaround in fleet-plan could not express: RELEASE=1 drops the
 # mpeg1/mpegts pair, so a dev lane and a release lane MUST NOT share one build tree. Different
 # flags hash to different keys and the two never meet — where the symlink recipe silently handed
 # one configuration the other's libraries. The cross and host builds key apart for the same
@@ -147,10 +147,9 @@ fi
 #              h264/hevc are the raw Annex-B paths (/tmp/sample.h264 and the dev triggers).
 #   parsers    needed by avformat_find_stream_info to fill AVCodecParameters.
 #   bsf        AVCC -> Annex-B for mp4-family video, which the Starfish pipeline requires.
-#   decoders   SUBTITLES ONLY. Video and audio are decoded by the TV's hardware via Starfish;
-#              FFmpeg here never touches a video frame.
+#   decoders   Subtitles and bounded software card previews. Full playback uses Starfish.
 #   encoder/   mpeg1video + mpegts are the DEV capture stream only, dropped by RELEASE=1 along
-#   muxer      with swscale, which nothing else uses.
+#   muxer      only. Swscale ships in every build for card previews.
 #
 # `--disable-autodetect` is NOT redundant beside `--disable-everything`, which governs the
 # component registry and says nothing about EXTERNAL libraries. Without it configure goes looking
@@ -193,12 +192,10 @@ set -- "$@" \
   --enable-demuxer=matroska,mov,mpegts,h264,hevc \
   --enable-parser=h264,hevc,aac,ac3,dvdsub,dvbsub \
   --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,extract_extradata \
-  --enable-decoder=pgssub,dvdsub,dvbsub,ass,srt,subrip,text,mov_text,webvtt \
+  --enable-decoder=h264,hevc,vp8,vp9,pgssub,dvdsub,dvbsub,ass,srt,subrip,text,mov_text,webvtt \
   --enable-protocol=file
 
-if [ "${RELEASE:-}" = "1" ]; then
-  set -- "$@" --disable-swscale
-else
+if [ "${RELEASE:-}" != "1" ]; then
   set -- "$@" --enable-encoder=mpeg1video --enable-muxer=mpegts
 fi
 

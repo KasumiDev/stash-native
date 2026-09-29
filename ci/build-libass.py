@@ -99,8 +99,10 @@ def build():
     darwin = host and platform.system() == 'Darwin'
     target = 'host' if host else 'arm'
     prefix = ROOT / ('vendor/libass-prefix-host' if host else 'vendor/libass-prefix')
-    work = ROOT / ('vendor/libass-build-host' if host else 'vendor/libass-build')
-    sources = ROOT / 'vendor/libass-sources'
+    work = (Path(os.environ['STASH_LIBASS_WORK']) if host and os.environ.get('STASH_LIBASS_WORK')
+            else ROOT / ('vendor/libass-build-host' if host else 'vendor/libass-build'))
+    sources = (Path(os.environ['STASH_LIBASS_SOURCES']) if host and os.environ.get('STASH_LIBASS_SOURCES')
+               else ROOT / 'vendor/libass-sources')
     for directory in [work, sources, prefix, ROOT / 'pkg']:
         directory.mkdir(parents=True, exist_ok=True)
     # A kernel-held lock disappears with its owner; no stale pid-file recovery.

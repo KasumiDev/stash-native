@@ -28,8 +28,8 @@ Makefile's `TV` and `tools/`' `TV_HOST` both fall back to; `make TV=1.2.3.4 …`
 invocation, and a target that needs a TV with neither set fails saying so. The ssh password
 `alpine` IS still in the Makefile and that is deliberate — it is webosbrew's *published* dev-mode
 root password, identical on every rooted webOS TV, so it identifies nobody and removing it would
-break the loop for everyone. App id `com.beb.plxnative` — and since 2026-08-21 a second
-install, `com.beb.plxnative.debug`, can sit beside it on the same set (`FLAVOR`, below;
+break the loop for everyone. App id `com.stashnative.app` — and since 2026-08-21 a second
+install, `com.stashnative.app.debug`, can sit beside it on the same set (`FLAVOR`, below;
 `docs/two-installs.md`).
 
 ## Build / deploy / run
@@ -41,10 +41,10 @@ the pinned Sentry Native cross-build), and `sshpass` (Homebrew, for deploy/run).
 
 - `make setup-env` — download + extract + `relocate-sdk.sh` the webOS NDK into `$(WEBOS_SDK)`
   (default `~/webos-ndk/…`). One-time; re-run `relocate-sdk.sh` if you move the SDK.
-- `tools/sim.ps1 setup|build|run|shot|send` — Windows 11 UI/Plex simulator through the existing
+- `tools/sim.ps1 setup|build|run|shot|send` — Windows 11 Stash simulator through the existing
   Ubuntu 22.04 WSLg runtime. It uses GPU-accelerated desktop OpenGL, keeps build/runtime state on
   WSL's Linux filesystem, and stages fonts, their notice and the bundled ASS renderer into an isolated app directory. Its `make sim-wsl`
-  build is optimized and deliberately skips host FFmpeg, so it covers UI, sign-in, Plex browsing,
+  build includes bundled host FFmpeg for card previews and Stash browsing,
   screenshots and remote commands but not demux/clock-sink playback. WSLg's non-blocking GLX swap
   is capped at 60 Hz in the Linux host build. The launcher also refuses WSLg's `use_gfxredir=0`
   copy fallback, where GL swaps can remain at 60 while the Windows surface updates at only a few
@@ -195,10 +195,10 @@ the pinned Sentry Native cross-build), and `sshpass` (Homebrew, for deploy/run).
   `docs/macos-app.md` is the design note, and `docs/macos-app-readme.md` is what ships beside the
   zip for the recipient.
 - **`FLAVOR`** selects **WHICH INSTALL** every TV-facing target talks to. Three builds live on one
-  television: `stable` (`com.beb.plxnative` — the app users install, the id in every release,
-  manifest and channel listing), `debug` (`com.beb.plxnative.debug` — the day-to-day developer
+  television: `stable` (`com.stashnative.app` — the app users install, the id in every release,
+  manifest and channel listing), `debug` (`com.stashnative.app.debug` — the day-to-day developer
   build beside it, with its own launcher tile, its own sign-in and its own runtime root), and
-  `nightly` (`com.beb.plxnative.nightly` — a third install beside both, tile "PlxNative Nightly",
+  `nightly` (`com.stashnative.app.nightly` — a third install beside both, tile "PlxNative Nightly",
   own sign-in, own runtime root, but ALWAYS a `RELEASE=1` build — `release-guard` refuses one
   without it, with no `ALLOW_DEV_ON_STABLE`-shaped hatch, because nightly ships no dev-trigger
   surface ever).
@@ -355,7 +355,7 @@ its own and PINS it.** This doc used to file FFmpeg beside curl and ACB as "SONA
 55→57→58→59→60", which is the wrong mental model to carry into any FFmpeg change today.
 `ci/build-ffmpeg.sh` cross-compiles FFmpeg **9.0** with the NDK — shared, LGPL-clean (no
 `--enable-gpl`), under a `-plx` build suffix: `libavutil-plx.so.61`, `libavcodec-plx.so.63`,
-`libavformat-plx.so.63`, plus `libswscale-plx.so.10` in dev builds only. `make deploy`/`make ipk`
+`libavformat-plx.so.63`, plus `libswscale-plx.so.10` in every build for card previews. `make deploy`/`make ipk`
 ship those `.so` files **beside the binary**, and `ff.rs::load_libraries` opens them by **absolute
 path out of `paths::app_dir()`**, in dependency order under `RTLD_GLOBAL` (they carry no rpath —
 FFmpeg's configure evals its flags and `$ORIGIN` does not survive), after which `boot()` refuses to
@@ -990,7 +990,7 @@ which the linking section explains is load-bearing rather than tidy.
   access.
 
   ```text
-  identity schema=1 seq=2 app_id=com.beb.plxnative flavour=stable version=0.6.0 uid=6303 euid=6303 gid=5000 egid=5000
+  identity schema=1 seq=2 app_id=com.stashnative.app flavour=stable version=0.6.0 uid=6303 euid=6303 gid=5000 egid=5000
   groups values=29,44,505,509,777,5000 errno=0 truncated=false
   dir label=tmp uid=0 gid=0 mode=1777 readonly=false open_errno=0 stat_errno=0 mount_errno=0 create_errno=0 write_errno=0 close_errno=0 unlink_errno=0
   dir label=runtime uid=6303 gid=5000 mode=0700 readonly=false open_errno=0 stat_errno=0 mount_errno=0 create_errno=0 write_errno=0 close_errno=0 unlink_errno=0
@@ -1238,7 +1238,7 @@ table selected on `target_pointer_width` with `ci/ffabi-assert.c` holding both. 
 clamped to the last fed PTS, position reported at the television's measured 5 Hz) and the whole
 pipeline between the socket and the decoder runs on the Mac: both AVIO transports, `ff.rs`'s
 demux, the AU queues and their byte-cap backpressure, the feed-ahead throttle, rung transactions,
-seek. The Windows `sim-wsl` target deliberately omits FFmpeg and stops at the host no-video seam.
+seek. The Windows `sim-wsl` target now builds bundled host FFmpeg for software scene previews; full LG playback still requires the television.
 Measured the day the macOS path landed: 94 `abr:` lines and a rung commit in one 30 s host run against
 `tests/serve_fixtures.py`. Until then this half was device-only and `make sim-macos` said so
 (`ff: FFmpeg unavailable — the app runs, playback will refuse`), which is why the ABR work was
@@ -1594,7 +1594,7 @@ path. Never run only this one before a release. `tests/README.md` has the tier t
   lists the ones worth knowing by name. **The ROOT moved for flavoured installs and ONLY for
   them:** the stable install keeps `/tmp` byte for byte, so every `/tmp/plxnative-*` path written
   out below stays literally true for the app users get, while a flavoured install puts the SAME
-  names under `/tmp/<app id>` (`/tmp/com.beb.plxnative.debug/plxnative-library`). Nothing was
+  names under `/tmp/<app id>` (`/tmp/com.stashnative.app.debug/plxnative-library`). Nothing was
   renamed — not the ~40 triggers, not the `plxnative-remote` FIFO, not the runtime logs, not
   `dev::DIAG`; only the directory they sit in. `make -s print-rundir FLAVOR=<f>` is how a tool asks
   rather than restating the rule, and the root is created **1777, mkdir THEN an explicit chmod**

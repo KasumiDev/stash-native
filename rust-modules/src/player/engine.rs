@@ -1117,7 +1117,7 @@ fn start_bufferfeed_inner(
     // fixed payloads.)
     // dev A/B: /tmp/plxnative-noaudio feeds video only (needAudio:false + skip es=2) to isolate
     // whether the audio ES (E-AC3/Atmos) is what stalls the sink on 4K HEVC.
-    let no_audio = crate::dev::flag("noaudio");
+    let no_audio = crate::dev::flag("noaudio") || (crate::route::stash_owned(ps) && crate::route::stream_acodec(ps).is_empty());
     crate::ff::set_feed_audio(!no_audio);
     let stream_payload;
     // Every arm below assigns this — the static payloads through `static_envelope`, the streamed
@@ -1445,6 +1445,14 @@ pub(crate) fn arm_seek(target_ns: i64) {
     SHARED.seek_to_ns.store(t, Ordering::Release);
     SHARED.disp_base.store(0, Ordering::Relaxed);
     SHARED.playpos_ns.store(t, Ordering::Relaxed); // instant HUD feedback until frames land
+}
+
+/// Stash's progressive MP4 starts a new zero-based encode at `?start=seconds`. It cannot
+/// accept byte-range seeking, so carry content time without asking AVIO to seek that encode.
+pub(crate) fn stash_stream_offset(offset_ns:i64) {
+    SHARED.seek_to_ns.store(-1,Ordering::Release);
+    SHARED.disp_base.store(offset_ns.max(0),Ordering::Relaxed);
+    SHARED.playpos_ns.store(offset_ns.max(0),Ordering::Relaxed);
 }
 
 /// Resume/seek AT the first Load. A direct-play item seeks the demuxer (av_seek via arm_seek).
@@ -2787,8 +2795,8 @@ mod payload_tests {
         }
     }
 
-    /// **The shipped app's payload must be byte-identical to what every release so far sent**, and
-    /// the splice anchor must be the composed key rather than a second spelling of it.
+    /// The payload must use StashNative's installed identity, and the splice anchor must be
+    /// the composed key rather than a second spelling of it.
     ///
     /// This is the whole safety argument for making the id dynamic. The webOS 5+ `windowId` path
     /// cannot be exercised on this project's 4.5 dev set (`vp_mode()` returns `VP_ACB` there and
@@ -2796,8 +2804,8 @@ mod payload_tests {
     /// and no error line — would not be seen until somebody else's television. Pinning the
     /// composed bytes here is the only gate available for it.
     #[test]
-    fn the_shipped_app_composes_the_payload_it_always_did() {
-        let want = r#""appId":"com.beb.plxnative""#;
+    fn the_shipped_app_composes_the_stash_identity() {
+        let want = r#""appId":"com.stashnative.app""#;
         for (name, p) in [
             ("PAYLOAD_V", PAYLOAD_V),
             ("PAYLOAD_AV", PAYLOAD_AV),

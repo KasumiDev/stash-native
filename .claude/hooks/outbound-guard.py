@@ -205,6 +205,8 @@ BYPASS = re.compile(r"\bPLX_PUBLISH_BYPASS=1\b")
 # Logs (`.tv-stream.log`) are deliberately absent: they are large, they churn, and the private
 # thing in them is the TV address, which `.tv-host` already supplies.
 PRIVATE_FILES = (
+    ".stash.local.json",
+    "stash.local.json",
     ".tv-host",
     ".tv-mac",
     "src/config.local.h",

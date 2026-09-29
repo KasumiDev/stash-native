@@ -5,14 +5,13 @@ param(
     [string]$Action = "run",
 
     [string]$Distro = "Ubuntu-22.04",
-    [string]$PmsHost = "",
-    [ValidateRange(1, 65535)]
-    [int]$PmsPort = 32400,
+    [string]$ServerUrl = "",
+    [string]$ApiKey = "",
+    [string]$ConfigPath = "",
     [string]$RuntimeDir = "",
     [string]$TargetDir = "",
     [string]$AssetDir = "",
     [string]$Output = "",
-    [switch]$StageToken,
 
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$InputTokens
@@ -137,59 +136,48 @@ $repoWindows = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $repoLinux = ConvertTo-WslPath $repoWindows
 $commonEnvironment = @{
     PLX_REPO = $repoLinux
-    PLX_PMS = $PmsHost
-    PLX_PORT = $(if ($PSBoundParameters.ContainsKey("PmsPort")) {
-        $PmsPort.ToString([System.Globalization.CultureInfo]::InvariantCulture)
-    } else { "" })
+    STASH_URL = $ServerUrl
+    STASH_API_KEY = $ApiKey
     PLX_RUNTIME = $RuntimeDir
     PLX_TARGET = $TargetDir
     PLX_ASSETS = $AssetDir
-    PLX_STAGE_TOKEN = $(if ($StageToken) { "1" } else { "" })
+}
+if ($ConfigPath) {
+    $commonEnvironment.STASH_CONFIG_SOURCE = ConvertTo-WslPath (Get-AbsoluteWindowsPath $ConfigPath)
 }
 
 $prepare = @'
 set -euo pipefail
 . "$HOME/.cargo/env"
 repo="$PLX_REPO"
-runtime="${PLX_RUNTIME:-$HOME/.local/state/plxnative-sim}"
-target="${PLX_TARGET:-$HOME/.cache/plxnative-sim/target}"
-assets="${PLX_ASSETS:-$HOME/.local/share/plxnative-sim/assets}"
+runtime="${PLX_RUNTIME:-$HOME/.local/state/stashnative-sim}"
+target="${PLX_TARGET:-$HOME/.cache/stashnative-sim/target}"
+assets="${PLX_ASSETS:-$HOME/.local/share/stashnative-sim/assets}"
 mkdir -p "$runtime" "$target" "$assets"
 # All launch paths use the same build-and-stage operation. The ASS library is
 # produced by make, and the process loads it from PLXNATIVE_APP_DIR, not pkg/.
 build_simulator() {
     cd "$repo"
-    make sim-wsl SIM_TDIR="$target"
+    export STASH_LIBASS_WORK="$HOME/.cache/stashnative-sim/libass-build"
+    export STASH_LIBASS_SOURCES="$HOME/.cache/stashnative-sim/libass-sources"
+    CARGO_INCREMENTAL=0 make sim-wsl SIM_TDIR="$target"
     for file in appfont.ttf appfont-bold.ttf appfont-cjk.ttf OFL.txt libass-plx-host.so.0; do
         staged="$assets/$file.$$.new"
         install -m 0644 "$repo/pkg/$file" "$staged"
         mv -f "$staged" "$assets/$file"
     done
+    for file in "$repo"/pkg/ffmpeg-host/lib*-plx.so.*; do
+        staged="$assets/$(basename "$file").$$.new"
+        install -m 0644 "$file" "$staged"
+        mv -f "$staged" "$assets/$(basename "$file")"
+    done
 }
-if [ "${PLX_STAGE_TOKEN:-}" = 1 ]; then
-    token=""
-    if [ -f "$repo/src/config.local.h" ]; then
-        token=$(sed -n 's/^#define[[:space:]]*PMS_TOKEN[[:space:]]*"\([^"]*\)".*/\1/p' "$repo/src/config.local.h" | head -n 1 || true)
-    fi
-    if [ -z "$token" ]; then
-        echo "No PMS_TOKEN was found in src/config.local.h." >&2
-        exit 1
-    fi
-    umask 077
-    printf '%s' "$token" > "$runtime/plxnative-token"
-    echo "Plex token staged in the private simulator runtime directory."
-elif [ -s "$runtime/plxnative-token" ]; then
-    echo "Using the token already staged in the simulator runtime directory."
+if [ -n "${STASH_CONFIG_SOURCE:-}" ]; then
+    install -m 0600 "$STASH_CONFIG_SOURCE" "$runtime/stash.json"
 fi
-pms="${PLX_PMS:-}"
-if [ -z "$pms" ] && [ -f "$repo/src/config.local.h" ]; then
-    pms=$(sed -n 's/^#define[[:space:]]*PMS_HOST[[:space:]]*"\([^"]*\)".*/\1/p' "$repo/src/config.local.h" | head -n 1 || true)
-fi
-port="${PLX_PORT:-}"
-if [ -z "$port" ] && [ -f "$repo/src/config.local.h" ]; then
-    port=$(sed -n 's/^#define[[:space:]]*PMS_PORT[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$repo/src/config.local.h" | head -n 1 || true)
-fi
-port="${port:-32400}"
+# Empty command-line values must not erase the stored server configuration.
+if [ -z "${STASH_URL:-}" ]; then unset STASH_URL; fi
+if [ -z "${STASH_API_KEY:-}" ]; then unset STASH_API_KEY; fi
 export PLXNATIVE_RUNTIME_DIR="$runtime"
 export PLXNATIVE_APP_DIR="$assets"
 export PLXNATIVE_WIN=1920x1080
@@ -198,8 +186,8 @@ export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-x11}"
 
 $instanceLocks = @'
 set -euo pipefail
-runtime="${PLX_RUNTIME:-$HOME/.local/state/plxnative-sim}"
-target="${PLX_TARGET:-$HOME/.cache/plxnative-sim/target}"
+runtime="${PLX_RUNTIME:-$HOME/.local/state/stashnative-sim}"
+target="${PLX_TARGET:-$HOME/.cache/stashnative-sim/target}"
 mkdir -p "$runtime" "$target"
 exec 9>"$runtime/plxnative-sim.lock"
 if ! flock -n 9; then
@@ -219,7 +207,7 @@ switch ($Action) {
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y build-essential cmake pkg-config libsdl2-dev libsdl2-ttf-dev libgl1-mesa-dev mesa-utils curl ca-certificates util-linux
+apt-get install -y build-essential cmake pkg-config libsdl2-dev libsdl2-ttf-dev libgl1-mesa-dev mesa-utils curl ca-certificates util-linux python3 python3-pil python3-numpy libclang-dev sshpass nasm
 '@
         Invoke-WslShell -Script @'
 set -e
@@ -228,6 +216,7 @@ if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
 fi
 . "$HOME/.cargo/env"
 rustup toolchain install stable --profile minimal
+rustup toolchain install nightly --profile minimal --component rust-src --component clippy
 pkg-config --print-errors --exists sdl2 SDL2_ttf gl
 renderer=$(glxinfo -B)
 printf '%s\n' "$renderer" | sed -n '1,12p'
@@ -249,13 +238,13 @@ echo "Built $target/release/plxnative-sim"
         Invoke-WslShell -Environment $commonEnvironment -Script ($instanceLocks + "`n" + $prepare + "`n" + @'
 build_simulator
 printf '%s\n' "$$" > "$runtime/plxnative-sim.pid"
-exec "$target/release/plxnative-sim" "$pms" "$port"
+exec "$target/release/plxnative-sim"
 '@)
     }
     "shot" {
         Assert-WslgFastTransport
         if ([string]::IsNullOrWhiteSpace($Output)) {
-            $Output = Join-Path (Get-Location) "plxnative-shot.png"
+            $Output = Join-Path (Get-Location) "stashnative-shot.png"
         }
         $outputAbsolute = Get-AbsoluteWindowsPath $Output
         $commonEnvironment.PLX_OUTPUT = ConvertTo-WslPath $outputAbsolute
@@ -265,7 +254,7 @@ mkdir -p "$(dirname "$PLX_OUTPUT")"
 base="$runtime/windows-shot.png"
 captured="$runtime/windows-shot-1.png"
 rm -f "$base" "$captured"
-PLXNATIVE_SHOT="$base" "$target/release/plxnative-sim" "$pms" "$port" &
+PLXNATIVE_SHOT="$base" "$target/release/plxnative-sim" &
 pid=$!
 printf '%s\n' "$pid" > "$runtime/plxnative-sim.pid"
 cleanup() {
@@ -321,8 +310,8 @@ echo "Wrote $PLX_OUTPUT"
         $commonEnvironment.PLX_TOKENS = $InputTokens -join " "
         Invoke-WslShell -Environment $commonEnvironment -Script @'
 set -euo pipefail
-runtime="${PLX_RUNTIME:-$HOME/.local/state/plxnative-sim}"
-target="${PLX_TARGET:-$HOME/.cache/plxnative-sim/target}"
+runtime="${PLX_RUNTIME:-$HOME/.local/state/stashnative-sim}"
+target="${PLX_TARGET:-$HOME/.cache/stashnative-sim/target}"
 fifo="$runtime/plxnative-remote"
 pid=$(cat "$runtime/plxnative-sim.pid" 2>/dev/null || true)
 actual=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)

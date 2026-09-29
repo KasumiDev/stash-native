@@ -35,6 +35,7 @@ they no longer do, because the TV's version moves with the firmware (libavformat
 | Shipped file | Upstream | Licence |
 |---|---|---|
 | `libavutil-plx.so.61`, `libavcodec-plx.so.63`, `libavformat-plx.so.63` | FFmpeg **9.0**, unmodified | LGPL-2.1-or-later |
+| `libswscale-plx.so.10` | FFmpeg **9.0**, unmodified | LGPL-2.1-or-later |
 
 **These libraries are covered by the GNU Lesser General Public License, version 2.1 or later.** A
 complete copy of that licence is supplied with this package at `licenses/LGPL-2.1.txt`.
@@ -48,8 +49,9 @@ repository, which is also attached to each release.
 
 **Configuration.** Built with `--disable-everything` plus an explicit component list, **without**
 `--enable-gpl`, `--enable-version3` or `--enable-nonfree`, so no GPL-licensed or non-free FFmpeg
-component is present. Only demuxers, parsers, bitstream filters and *subtitle* decoders are
-enabled — video and audio are decoded by the television's hardware, not by FFmpeg. The one
+component is present. Demuxers, parsers, bitstream filters, subtitle decoders, and the H.264,
+HEVC, VP8 and VP9 video decoders are enabled. Scene card previews use these software decoders
+and libswscale; full playback uses the television's hardware. The one
 external library enabled is **zlib**, the television's own `libz.so.1` (not redistributed — see
 section 3), which the Matroska demuxer needs to inflate compressed subtitle tracks.
 

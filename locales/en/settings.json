@@ -1,4 +1,8 @@
 {
+  "settings.stash.connection_saved": {
+    "value": "Connected and saved",
+    "description": "Confirmation after successfully testing the Stash server connection and saving its settings."
+  },
   "settings.title": {
     "value": "Settings",
     "description": "Settings, account, onboarding or privacy UI: settings.title"

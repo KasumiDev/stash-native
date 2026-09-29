@@ -1305,7 +1305,7 @@ mod upgrade_tests {
                     let rev = self.record.as_ref().and_then(|r| r["_rev"].as_u64()).unwrap_or(0) + 1;
                     next["_rev"] = serde_json::json!(rev);
                     self.record = Some(next);
-                    Ok(serde_json::json!({"returnValue":true,"results":[{"id":"plxstate.stable","rev":rev}]}))
+                    Ok(serde_json::json!({"returnValue":true,"results":[{"id":"stash.stable","rev":rev}]}))
                 }
                 other => panic!("unexpected DB8/Keymanager call {other}"),
             }
@@ -1319,12 +1319,17 @@ mod upgrade_tests {
                 ..Default::default()
             },
             crate::storage::state::Flavor::Stable,
-            "com.beb.plxnative.storage".into(),
+            "com.stashnative.app.storage".into(),
         )
     }
 
     fn db8_066() -> Value {
-        serde_json::from_str(DB8_066).unwrap()
+        // Keep historical fixtures intact while exercising their encoding in Stash's own DB8
+        // namespace. Production must continue rejecting upstream Plex record identities.
+        let fixture = DB8_066
+            .replace("plxstate.stable", crate::storage::state::Flavor::Stable.object_id())
+            .replace("com.beb.plxnative.storage:1", "com.stashnative.app.storage:1");
+        serde_json::from_str(&fixture).unwrap()
     }
 
     fn helper_load(b: &mut crate::storage::backend::Backend<Db8>, legacy: &[PathBuf]) -> Consent {

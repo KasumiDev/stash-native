@@ -1,17 +1,17 @@
 [
   {
     "name": "stable",
-    "app_id": "com.beb.plxnative",
-    "object_id": "plxstate.stable"
+    "app_id": "com.stashnative.app",
+    "object_id": "stash.stable"
   },
   {
     "name": "debug",
-    "app_id": "com.beb.plxnative.debug",
-    "object_id": "plxstate.debug"
+    "app_id": "com.stashnative.app.debug",
+    "object_id": "stash.debug"
   },
   {
     "name": "nightly",
-    "app_id": "com.beb.plxnative.nightly",
-    "object_id": "plxstate.night"
+    "app_id": "com.stashnative.app.nightly",
+    "object_id": "stash.night"
   }
 ]

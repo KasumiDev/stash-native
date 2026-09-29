@@ -3,16 +3,15 @@ name: CI
 # WHAT A GREEN RUN HERE MEANS: the code compiles for ARMv7-A soft-float with the right ABI and no
 # CP15 barriers, the pure logic is unbroken, no shadowed `else if` shipped, and the artifact is
 # well-formed. WHAT IT DOES NOT MEAN: that the app boots, binds the video plane, decodes a frame,
-# renders correctly, or holds 60 fps. There is no host runtime — the drawing, decoding and
-# platform-binding surface is all `extern "C"` into libraries only the TV has. `./tests/run.py`
-# against the real television remains the only evidence for any of that.
+# renders correctly on the TV, or holds 60 fps. The host simulator exercises UI and bundled
+# software previews; LG hardware playback and video-plane composition still require the TV.
 
 on:
   push:
     # A maintenance line (`release/vX.Y`, cut from a tag for a patch release) is a trunk of its own
     # for `release.yml`'s `line` input, so it gets the same push gate `main` does — otherwise the
     # first time a hotfix's changes are compiled in a clean checkout is the release run itself.
-    branches: [main, 'release/v*']
+    branches: [main, 'release/v*', 'codex/stashnative']
     # This gate is host checks (lint + unit suite) and an ARM cross-build — expensive (#261 spent
     # ~20 runner-minutes on a README-only PR), and neither stage reads prose. Verified by walking
     # the `make check` chain: no gate here parses `.md` content EXCEPT `docs/screenshots/CREDITS.md`
@@ -63,6 +62,7 @@ jobs:
     # error that reads nothing like "these two lines disagree".
     env:
       RUST_NIGHTLY: nightly
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -195,7 +195,7 @@ jobs:
         # DELIBERATELY the developer id. This artifact is a DEV build — the whole point of a PR
         # package is that you can sideload it with the `/tmp` trigger surface on — and
         # `release-guard` refuses a dev build on the id users install, correctly. So the artifact
-        # below is `com.beb.plxnative.debug_*.ipk` and installs BESIDE anyone's real one rather
+        # below is `com.stashnative.app.debug_*.ipk` and installs BESIDE anyone's real one rather
         # than over it. The release job is the only place `FLAVOR=stable` belongs (release.yml).
         # Named explicitly rather than inherited, so this is a decision on the page instead of a
         # default that moves if the Makefile's does.

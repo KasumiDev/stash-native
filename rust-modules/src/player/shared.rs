@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 #[derive(Default)]
 pub(crate) struct TrackNames {
     pub audio: Vec<String>,
+    pub audio_codecs: Vec<String>,
     pub subs: Vec<String>,
 }
 
@@ -32,6 +33,7 @@ impl TrackNames {
     pub const fn new() -> Self {
         Self {
             audio: Vec::new(),
+            audio_codecs: Vec::new(),
             subs: Vec::new(),
         }
     }

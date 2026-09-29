@@ -23,6 +23,7 @@
 //! modules).
 
 use crate::ui::machine::StoreOrd;
+pub(crate) mod stash;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EndpointRefresh { pub sid: crate::plex::ServerId }

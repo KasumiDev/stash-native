@@ -150,7 +150,7 @@ warnings = "deny"
 
 [dependencies]
 # safe pure-Rust JPEG/PNG decoders — replaces vendored stb_image.h (~8k lines C)
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 # raw socket/libc FFI for the stream module (correct constants + struct layouts)
 libc = "0.2"
 # JSON parsing for the pms module (replaces the C's hand-rolled string scrape)

@@ -29,8 +29,8 @@
 # make uninstall— remove this flavour from the TV (refuses the stable id)
 #
 # FLAVOR selects WHICH INSTALL every TV-facing target talks to: `debug` (the default —
-# com.beb.plxnative.debug, its own tile, its own sign-in, its own /tmp root) or `stable`
-# (com.beb.plxnative, the app users install). See the FLAVOR block below for why the default is the
+# com.stashnative.app.debug, its own tile, its own sign-in, its own /tmp root) or `stable`
+# (com.stashnative.app, the app users install). See the FLAVOR block below for why the default is the
 # developer one. A flavour must be `make FLAVOR=… install`ed once before `deploy` can reach it.
 #
 # RELEASE=1 drops BOTH default cargo features: `devtools` (the on-screen counter) and
@@ -83,10 +83,10 @@ tv-lock-require:
 
 # --- WHICH INSTALL: the FLAVOR axis --------------------------------------------------------
 #
-# Three builds live on one television: `stable` is the app users get (`com.beb.plxnative`, the id
+# Three builds live on one television: `stable` is the app users get (`com.stashnative.app`, the id
 # in every release, manifest and channel listing); `debug` is the day-to-day developer build
-# beside it (`com.beb.plxnative.debug`) with its own launcher tile, its own sign-in and its own
-# runtime files; `nightly` (`com.beb.plxnative.nightly`) is a third install beside both — same
+# beside it (`com.stashnative.app.debug`) with its own launcher tile, its own sign-in and its own
+# runtime files; `nightly` (`com.stashnative.app.nightly`) is a third install beside both — same
 # per-flavour shape (own tile, own sign-in, own runtime root) but ALWAYS a RELEASE=1 build (see
 # `release-guard` below), with its own bumped package version and a dated reported version
 # (`rust-modules/build.rs::emit_version`'s `PLX_CHANNEL=nightly` arm). webOS keys everything — the
@@ -108,7 +108,7 @@ tv-lock-require:
 # is watching.
 #
 # The whitelist is not decoration. `make FLAVOR=stabel deploy` would otherwise mint a third
-# registered app called `com.beb.plxnative.stabel` on the television (LG's id charset accepts it,
+# registered app called `com.stashnative.app.stabel` on the television (LG's id charset accepts it,
 # so nothing downstream objects) and the symptom is a mystery tile on a TV rather than a message on
 # a terminal. `$(error)` at parse time costs one line.
 FLAVORS     := $(shell python3 ci/flavor.py --list)
@@ -119,7 +119,7 @@ $(if $(filter $(FLAVOR),$(FLAVORS)),,$(error unknown FLAVOR "$(FLAVOR)" — one 
 # The id users get. Also `paths::STABLE_APP_ID` in the Rust half and `STABLE_ID` in ci/flavor.py —
 # three copies of one string, each in a language that cannot see the others, and ci/flavor.py's
 # selftest is what keeps them in step.
-APPID_STABLE = com.beb.plxnative
+APPID_STABLE = com.stashnative.app
 APPID        = $(if $(filter stable,$(FLAVOR)),$(APPID_STABLE),$(APPID_STABLE).$(FLAVOR))
 APPDIR       = /media/developer/apps/usr/palm/applications/$(APPID)
 
@@ -514,7 +514,7 @@ endif
 # leave the release binary in place under a plain `make`. The stamp's CONTENT is the flag set,
 # so switching configuration is a real prerequisite change.
 RUST_STAMP     = pkg/.build-config
-# The bundled FFmpeg is configured differently by RELEASE=1 too (no swscale, no mpeg1/mpegts), so
+# The bundled FFmpeg is configured differently by RELEASE=1 too (no dev MPEG1 encoder/mpegts muxer), so
 # it belongs in the SAME stamp. It was missed at first, and the failure was exactly the one this
 # mechanism exists to prevent, one layer down: `ci/build-ffmpeg.sh` is reached through a single
 # header sentinel, so make never re-ran it once the header existed, its own .plx-flags guard was
@@ -642,7 +642,7 @@ RUST_LIB    = rust-modules/$(RUST_TDIR)/$(RUST_TARGET)/release/libplxnative_modu
 
 # Every ordinary C translation unit ships; gpdebug remains an opt-in allocator guard.
 # ass.c belongs to the privately bundled renderer, never the application ELF.
-SRCS = $(filter-out src/gpdebug.c src/ass.c,$(wildcard src/*.c)) src/compat/getauxval.c
+SRCS = $(filter-out src/gpdebug.c src/ass.c src/stash_preview_stub.c,$(wildcard src/*.c)) src/compat/getauxval.c
 OBJS = $(SRCS:.c=.o)
 
 all: pkg/plxnative pkg/plxnative-storage
@@ -682,13 +682,17 @@ src/%.o: src/%.c $(wildcard src/*.h) Makefile $(CONFIG_LOCAL_STAMP)
 # every symbol table. Bundling makes both compile-time facts.
 #
 # Built once into vendor/ffmpeg-prefix (gitignored, derived); ~2 minutes cold, nothing after.
-# RELEASE=1 drops swscale and the mpeg1/mpegts pair, which only the dev capture stream uses.
+# RELEASE=1 drops only the dev MPEG1 encoder/mpegts muxer; previews require swscale.
 FFMPEG_PREFIX = vendor/ffmpeg-prefix
 FFMPEG_INC    = $(FFMPEG_PREFIX)/include
 # Staged into pkg/ under their SONAMEs, which is the name ff.rs dlopens by absolute path.
 FFMPEG_SONAMES = libavutil-plx.so.61 libavcodec-plx.so.63 libavformat-plx.so.63 \
-                 $(if $(RELEASE),,libswscale-plx.so.10)
+                 libswscale-plx.so.10
 FFMPEG_STAGED = $(addprefix pkg/,$(FFMPEG_SONAMES))
+
+# The software card decoder uses the exact headers of the libraries we ship.
+src/stash_preview.o: $(FFMPEG_INC)/libavformat/avformat.h
+src/stash_preview.o: CFLAGS += -I $(FFMPEG_INC)
 
 # One pinned ASS renderer and font stack on every firmware. Only the plx_ass_* facade
 # is exported; FreeType/FriBidi/HarfBuzz are static and cannot bind to firmware copies.
@@ -1515,7 +1519,7 @@ ipk: pkg/plxnative pkg/plxnative-storage $(APPINFO) release-guard
 
 # THE STABLE INSTALL IS ALWAYS A RELEASE BUILD, and that is a gate rather than a habit.
 #
-# `com.beb.plxnative` is the id users get. A dev-featured binary under it carries the whole
+# `com.stashnative.app` is the id users get. A dev-featured binary under it carries the whole
 # `/tmp` trigger surface, the world-writable `plxnative-remote` FIFO and the `:8910` capture
 # listener — the exact surface the `cut-release` skill's §2 exists to keep out of a shipped
 # artifact, seen from the other side. Before the flavour split this could only happen by
@@ -1527,7 +1531,7 @@ ipk: pkg/plxnative pkg/plxnative-storage $(APPINFO) release-guard
 # deleted rather than respected.
 # A LAB BUILD IS NEVER THE STABLE ID, and it never ships without its session file.
 #
-# Both halves are the same argument as `release-guard`'s, one feature along. `com.beb.plxnative` is
+# Both halves are the same argument as `release-guard`'s, one feature along. `com.stashnative.app` is
 # the id users install; a lab-featured binary under it carries an upload endpoint and a bearer
 # secret, which is the one thing in this repository that must never reach a stranger's television.
 # And a LAB build with no `pkg/lab.json` is inert — it boots, logs `lab: INERT`, and answers the
@@ -1809,10 +1813,15 @@ screenshots: screenshots-sim demo-library
 	  $(if $(SHOT_HERO_VARIANTS),--hero-variants,)
 	python3 tools/demo_library.py site-credits
 
-# Optimized Linux UI/Plex simulator with no host FFmpeg prerequisite. It runs natively on Linux;
+# Optimized Linux Stash simulator with bundled software card decoding. It runs natively on Linux;
 # Windows/WSLg uses the same binary through `tools/sim.ps1`. Play intentionally reaches the host
 # seam's existing "no video path" result.
-sim-linux: $(LIBASS_HOST_STAGED)
+FFMPEG_LINUX_STAGED = $(addprefix pkg/ffmpeg-host/,$(FFMPEG_SONAMES))
+$(FFMPEG_LINUX_STAGED): pkg/ffmpeg-host/%: $(FFMPEG_HOST_INC)/libavformat/avformat.h
+	@mkdir -p pkg/ffmpeg-host
+	cp -L $(FFMPEG_HOST_PREFIX)/lib/$* $@
+
+sim-linux: $(LIBASS_HOST_STAGED) $(FFMPEG_LINUX_STAGED)
 	PLX_SENTRY_DSN='$(PLX_SENTRY_DSN)' PLX_POSTHOG_KEY='$(PLX_POSTHOG_KEY)' \
 	  PLX_SENTRY_DSN_DEV='$(PLX_SENTRY_DSN_DEV)' PLX_POSTHOG_KEY_DEV='$(PLX_POSTHOG_KEY_DEV)' \
 	  cargo build --release --manifest-path rust-modules/Cargo.toml --target-dir "$$SIM_LINUX_TDIR_ENV" \

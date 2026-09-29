@@ -1467,6 +1467,7 @@ mod tests {
     fn a_track_index_resolves_by_position_and_an_absent_one_is_empty_not_a_neighbour() {
         let n = TrackNames {
             audio: vec!["Дубляж".into(), String::new(), "Original".into()],
+            audio_codecs: Vec::new(),
             subs: vec!["Forced".into(), "Full".into()],
         };
         assert_eq!(n.audio(0), "Дубляж");
