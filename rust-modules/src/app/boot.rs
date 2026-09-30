@@ -107,6 +107,15 @@ pub(crate) unsafe fn hide_cursor() {
         SDL_webOSCursorVisibility(0);
     }
 }
+
+/// Restore the Magic Remote pointer when its wheel explicitly selects pointer navigation.
+#[inline]
+pub(crate) unsafe fn show_cursor() {
+    #[cfg(not(feature = "hostsim"))]
+    {
+        SDL_webOSCursorVisibility(1);
+    }
+}
 /// Advance the once-per-second LOOP-RATE window: bump `iters_ct` and, when a full second has
 /// elapsed, recompute `loop_shown`, reset the window, and return `true` so the caller logs the
 /// heartbeat with its own route/overlay tag. Shared by the player and home/detail draw paths.

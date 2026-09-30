@@ -4,7 +4,7 @@ use crate::screens::stash_registry::*;
 use crate::stash::Config;
 use crate::stash::{Direction, Query};
 use crate::stores::stash::{PageData, Section, Tile, Work};
-use crate::ui::card_row::{CardRow, RowStyle};
+use crate::ui::card_row::{self, CardRow, RowStyle, TileLabel};
 use crate::ui::consts::{CARD_DY, GRID_TOP_Y, MARGIN_X, PEEK_Y, SCR_H, SCR_W, TITLE_DY};
 use crate::ui::frame::Budget;
 use crate::ui::geom::{Grid, Shelf};
@@ -12,6 +12,7 @@ use crate::ui::label::Label;
 use crate::ui::machine::*;
 use crate::ui::screen::*;
 use crate::ui::theme;
+use crate::ui::widgets::Art;
 use crate::ui::{Painter, Rect, View};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -71,6 +72,8 @@ pub struct StashScreen {
     next_key: u32,
     home_shelves: bool,
     detail_inset: Option<f32>,
+    scroll_motion: crate::ui::Spring,
+    scroll_target: f32,
 }
 impl StashScreen {
     fn pinned(row: &Row) -> bool {
@@ -120,6 +123,8 @@ impl StashScreen {
             next_key: 1,
             home_shelves: false,
             detail_inset: None,
+            scroll_motion: crate::ui::Spring::at(0.),
+            scroll_target: 0.,
         }
     }
     pub(crate) fn home(entry: EntryId) -> Self {
@@ -143,6 +148,8 @@ impl StashScreen {
     }
     pub(crate) fn shelf_scroll(&mut self, value: f32) {
         self.state.scroll = value;
+        self.scroll_target = value;
+        self.scroll_motion = crate::ui::Spring::at(value);
     }
     pub(crate) fn home_scroll_target(&self, key: u32) -> Option<f32> {
         self.position(key)
@@ -180,7 +187,7 @@ impl StashScreen {
         Query {
             q: self.state.query.clone(),
             page: self.state.page.max(1),
-            per_page: 24,
+            per_page: 50,
             sort: match self.route {
                 StashArg::Performers => "o_counter",
                 StashArg::Tags => "name",
@@ -213,6 +220,103 @@ impl StashScreen {
             },
         )));
         fx.invalidate(crate::ui::present::Provenance::Input);
+    }
+    /// Merge provider pages without changing existing seats or accepting an endless
+    /// duplicate-only page from a server whose count changed during browsing.
+    fn land_page(&mut self, data: &PageData) {
+        if !self.state.append {
+            self.data = data.clone();
+            return;
+        }
+        let mut added = 0;
+        for section in &data.sections {
+            if let Some(existing) = self
+                .data
+                .sections
+                .iter_mut()
+                .find(|s| s.title == section.title)
+            {
+                for tile in &section.tiles {
+                    if !existing.tiles.iter().any(|t| t.identity == tile.identity) {
+                        existing.tiles.push(tile.clone());
+                        added += 1;
+                    }
+                }
+            } else {
+                added += section.tiles.len();
+                self.data.sections.push(section.clone());
+            }
+        }
+        for image in &data.images {
+            if !self.data.images.iter().any(|i| i.id == image.id) {
+                self.data.images.push(image.clone());
+            }
+        }
+        self.data.count = data.count;
+        self.data.has_more = data.has_more && added > 0;
+    }
+    fn near_page_end(&self, focused: Option<u32>) -> bool {
+        self.data
+            .sections
+            .iter()
+            .filter(|section| {
+                !matches!(self.route, StashArg::Home) || section.title == "Performers"
+            })
+            .any(|section| {
+                if section.tiles.is_empty() {
+                    return false;
+                }
+                let focus_near = focused
+                    .and_then(|key| self.position(key))
+                    .and_then(|(r, c)| {
+                        section
+                            .tiles
+                            .iter()
+                            .position(|t| t.identity == self.rows[r].tiles[c].identity)
+                    })
+                    .is_some_and(|index| index + 12 >= section.tiles.len());
+                if focus_near {
+                    return true;
+                }
+                // Grid pages prefetch as their final row approaches the viewport. A
+                // horizontal Home strip waits for its trailing cards to approach it.
+                let Some(last) = section.tiles.last() else {
+                    return false;
+                };
+                self.rows
+                    .iter()
+                    .find_map(|row| {
+                        row.tiles
+                            .iter()
+                            .position(|t| t.identity == last.identity)
+                            .map(|col| (row, col))
+                    })
+                    .is_some_and(|(row, col)| {
+                        if matches!(self.route, StashArg::Home) {
+                            let x = row.style.margin_x + col as f32 * (row.style.w + row.style.gap)
+                                - row.motion.scroll_x();
+                            x <= SCR_W + row.style.w * 2. && self.row_y(row) < SCR_H
+                        } else {
+                            self.row_y(row) <= SCR_H + row.style.h
+                                && self.row_y(row) >= self.content_view().y
+                        }
+                    })
+            })
+    }
+    fn prefetch(&mut self, focused: Option<u32>, fx: &mut Effects<'_, StashHost>) {
+        if self.state.covered
+            || self.state.loading
+            || self.state.shelf_loading
+            || self.state.editing != 0
+            || !self.state.error.is_empty()
+            || !self.data.has_more
+            || !self.near_page_end(focused)
+        {
+            return;
+        }
+        self.state.page = self.state.page.saturating_add(1);
+        self.state.append = true;
+        self.load(fx);
     }
     fn next_shelf(&mut self, fx: &mut Effects<'_, StashHost>) {
         if self.state.covered {
@@ -274,16 +378,6 @@ impl StashScreen {
                     Action::Sort,
                 ));
             }
-            if !matches!(self.route, StashArg::Home | StashArg::Scene(_))
-                && (self.data.count == 0
-                    || self
-                        .data
-                        .sections
-                        .first()
-                        .is_some_and(|s| s.tiles.len() < self.data.count))
-            {
-                controls.push(Self::control("more", "Next page".into(), Action::More));
-            }
         }
         if !self.home_shelves
             && (self.detail_inset.is_none()
@@ -343,26 +437,16 @@ impl StashScreen {
                     ..RowStyle::EPISODE
                 }
             } else if s.portrait {
-                RowStyle {
-                    w: 200.,
-                    h: 285.,
-                    gap: 28.,
-                    ..RowStyle::HOME
-                }
+                RowStyle::HOME
             } else {
-                RowStyle {
-                    w: 380.,
-                    h: 214.,
-                    gap: 28.,
-                    ..RowStyle::EPISODE
-                }
+                RowStyle::EPISODE
             };
             let chunk = if matches!(self.route, StashArg::Home) || control {
-                24
+                s.tiles.len().max(1)
             } else if matches!(self.route, StashArg::Tags) {
                 1
             } else if s.portrait {
-                7
+                crate::ui::poster_grid::COLS
             } else {
                 4
             };
@@ -417,7 +501,7 @@ impl StashScreen {
                     } else if matches!(self.route, StashArg::Tags) {
                         theme::space::SM
                     } else {
-                        88.
+                        TileLabel::height(true)
                     };
             }
         }
@@ -553,13 +637,12 @@ impl StashScreen {
                 fx.push(Fx::Nav(NavOp::Push(StashArg::Player(scene.id))));
             }
             Action::Refresh => {
-                self.state.page = 1;
-                self.state.append = false;
-                self.load(fx);
-            }
-            Action::More => {
-                self.state.page += 1;
-                self.state.append = true;
+                if self.state.loading {
+                    return;
+                }
+                if !self.state.append {
+                    self.state.page = 1;
+                }
                 self.load(fx);
             }
             Action::Sort => {
@@ -665,37 +748,12 @@ impl Machine<StashHost> for StashScreen {
                 Handled::Yes
             }
             ScreenEvent::Async(_, StashMsg::Loaded { generation, result })
-                if *generation == self.state.generation =>
+                if *generation == self.state.generation && self.state.loading =>
             {
                 self.state.loading = false;
                 match result {
                     Ok(data) => {
-                        if self.state.append {
-                            for section in &data.sections {
-                                if let Some(existing) = self
-                                    .data
-                                    .sections
-                                    .iter_mut()
-                                    .find(|s| s.title == section.title)
-                                {
-                                    for tile in &section.tiles {
-                                        if !existing
-                                            .tiles
-                                            .iter()
-                                            .any(|t| t.identity == tile.identity)
-                                        {
-                                            existing.tiles.push(tile.clone());
-                                        }
-                                    }
-                                } else {
-                                    self.data.sections.push(section.clone());
-                                }
-                            }
-                            self.data.images.extend(data.images.clone());
-                            self.data.count = data.count;
-                        } else {
-                            self.data = data.clone();
-                        }
+                        self.land_page(data);
                         self.state.append = false;
                         self.rebuild();
                         self.media(cx, fx);
@@ -749,14 +807,24 @@ impl Machine<StashHost> for StashScreen {
             ScreenEvent::FocusMoved { to, .. } => {
                 if let Some((r, _)) = self.position(to.elem) {
                     let row = &self.rows[r];
-                    if Self::pinned(row) || self.home_shelves {
-                    } else if row.y - self.state.scroll + row.style.h > 980. {
-                        self.state.scroll = row.y + row.style.h - 980.;
-                    } else if row.y - self.state.scroll < CONTENT_VIEW.y + 48. {
-                        self.state.scroll = (row.y - CONTENT_VIEW.y - 48.).max(0.);
+                    if !Self::pinned(row) && !self.home_shelves {
+                        let max = self
+                            .rows
+                            .last()
+                            .map_or(0., |last| {
+                                last.y + last.style.h + TileLabel::height(true) - SCR_H
+                            })
+                            .max(0.);
+                        self.scroll_target = card_row::reveal(
+                            self.state.scroll,
+                            row.y + row.style.h + TileLabel::height(true) - SCR_H,
+                            row.y - self.content_view().y - card_row::heading_lift_max(&row.style),
+                            max,
+                        );
                     }
                 }
                 self.media(cx, fx);
+                self.prefetch(Some(to.elem), fx);
                 if self
                     .position(to.elem)
                     .is_some_and(|(r, _)| r + 2 >= self.rows.len())
@@ -827,6 +895,14 @@ impl Machine<StashHost> for StashScreen {
                 Handled::Yes
             }
             ScreenEvent::Tick(t) => {
+                if !self.home_shelves {
+                    self.scroll_motion.step(
+                        self.scroll_target,
+                        crate::ui::consts::K_SCROLL,
+                        t.dt(),
+                    );
+                    self.state.scroll = self.scroll_motion.pos;
+                }
                 let focused = cx.focus.current.and_then(|k| self.position(k.elem));
                 for (i, row) in self.rows.iter_mut().enumerate() {
                     row.motion.update(
@@ -839,6 +915,7 @@ impl Machine<StashHost> for StashScreen {
                 if t.ms.wrapping_sub(self.state.media_at) >= 100 {
                     self.media(cx, fx);
                     self.state.media_at = t.ms;
+                    self.prefetch(cx.focus.current.map(|k| k.elem), fx);
                 }
                 Handled::Yes
             }
@@ -850,6 +927,7 @@ impl Machine<StashHost> for StashScreen {
             ScreenEvent::StoreChanged(STASH_ACTIVITY, _)
                 if !self.state.covered && !self.state.loading =>
             {
+                self.state.page = 1;
                 self.state.append = false;
                 self.load(fx);
                 Handled::Yes
@@ -946,17 +1024,54 @@ impl Screen<StashHost> for StashScreen {
                 p.clipped(self.content_view())
             };
             if !row.title.is_empty() {
-                label(
+                card_row::draw_heading(
                     p,
                     &row.title,
-                    Rect::new(
-                        MARGIN_X,
-                        y - CARD_DY - TITLE_DY,
-                        SCR_W - 2. * MARGIN_X,
-                        theme::space::LG,
-                    ),
-                    theme::size::HEADLINE,
-                    theme::TEXT_PRIMARY,
+                    "",
+                    MARGIN_X,
+                    y - CARD_DY - TITLE_DY - row.motion.lift(),
+                    SCR_W - 2. * MARGIN_X,
+                    f.cx.measure,
+                );
+            }
+            let buttons = Self::pinned(row) || matches!(self.route, StashArg::Tags);
+            if !buttons {
+                let focused =
+                    f.cx.focus
+                        .current
+                        .filter(|k| k.entry == self.entry)
+                        .and_then(|k| row.keys.iter().position(|key| *key == k.elem));
+                card_row::strip(
+                    p,
+                    &row.motion,
+                    row.tiles.len(),
+                    focused.map_or(-1, |i| i as i32),
+                    y,
+                    (row.style.w, row.style.h),
+                    row.style.w + row.style.gap,
+                    &row.style,
+                    SCR_W,
+                    |i| {
+                        let tile = &row.tiles[i];
+                        let preview = format!("preview:{}", tile.identity);
+                        let image = if focused == Some(i) {
+                            f.cx.views
+                                .textures
+                                .get(&preview)
+                                .or_else(|| f.cx.views.textures.get(&tile.identity))
+                        } else {
+                            f.cx.views.textures.get(&tile.identity)
+                        };
+                        Art::Texture {
+                            key: &tile.identity,
+                            image: image.copied(),
+                            portrait: tile.identity.starts_with("performer:"),
+                        }
+                    },
+                    |_| None,
+                    |i| TileLabel::titled(&row.tiles[i].title, &row.tiles[i].caption),
+                    |_, _, _, _| {},
+                    f.cx.measure,
                 );
             }
             for (c, tile) in row.tiles.iter().enumerate() {
@@ -1002,53 +1117,6 @@ impl Screen<StashHost> for StashScreen {
                         crate::ui::widgets::Button::new(text.as_ptr(), theme::size::CAPTION, rect)
                             .focused(focus);
                     button.draw(&crate::ui::Env::inert(), p);
-                } else {
-                    let tint = theme::TEXT_PRIMARY;
-                    let preview_key = format!("preview:{}", tile.identity);
-                    let texture = if focus {
-                        f.cx.views
-                            .textures
-                            .get(&preview_key)
-                            .or_else(|| f.cx.views.textures.get(&tile.identity))
-                    } else {
-                        f.cx.views.textures.get(&tile.identity)
-                    };
-                    if let Some((tex, w, h)) = texture {
-                        p.tex_carded(
-                            *tex,
-                            rect.cover_uv(*w, *h, crate::ui::Crop::Centre),
-                            rect,
-                            theme::CARD_RING_RAD,
-                            tint,
-                            if focus { 1. } else { 0. },
-                        );
-                    } else {
-                        p.rect(
-                            rect,
-                            theme::CARD_RING_RAD,
-                            theme::CONTROL_IDLE_FILL,
-                            theme::CONTROL_IDLE_FILL,
-                            if focus { 1. } else { 0. },
-                        );
-                    }
-                    let text = crate::text::elide_by(&tile.title, rect.w, false, |s| {
-                        let text = std::ffi::CString::new(s.replace('\0', "")).unwrap();
-                        f.cx.measure.width(&text, theme::size::CAPTION, false)
-                    });
-                    label(
-                        p,
-                        &text,
-                        Rect::new(rect.x, y + row.style.h + 8., rect.w, 35.),
-                        theme::size::CAPTION,
-                        theme::TEXT_PRIMARY,
-                    );
-                    label(
-                        p,
-                        &tile.caption,
-                        Rect::new(rect.x, y + row.style.h + 42., rect.w, 30.),
-                        theme::size::CAPTION,
-                        theme::TEXT_SECONDARY,
-                    );
                 }
             }
         }
@@ -1150,8 +1218,21 @@ mod tests {
         let screen = StashScreen::new(StashArg::Performers, EntryId(1));
         let query = screen.query();
         assert_eq!(query.page, 1);
+        assert_eq!(query.per_page, 50);
         assert_eq!(query.sort, "o_counter");
         assert_eq!(query.direction, Direction::Descending);
+    }
+    #[test]
+    fn paginated_catalog_has_no_manual_next_page_control() {
+        let mut screen = StashScreen::new(StashArg::Scenes, EntryId(1));
+        screen.data = data(&["a"]);
+        screen.data.count = 100;
+        screen.rebuild();
+        assert!(!screen
+            .rows
+            .iter()
+            .flat_map(|r| &r.tiles)
+            .any(|t| t.identity == "control:more"));
     }
     #[test]
     fn home_catalog_only_projects_shelves_below_the_billboard() {
@@ -1208,6 +1289,74 @@ mod tests {
         assert_eq!(screen.rows[2].tiles.len(), 1);
         assert_eq!(screen.rows[1].style.h, 72.);
         assert_eq!(screen.rows[1].style.w, SCR_W - 2. * MARGIN_X);
+    }
+    fn fifty_scenes() -> PageData {
+        let ids = (1..=50).map(|id| id.to_string()).collect::<Vec<_>>();
+        let refs = ids.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut page = data(&refs);
+        page.count = 120;
+        page.has_more = true;
+        page
+    }
+    #[test]
+    fn prefetch_requests_once_near_end_and_never_while_covered() {
+        let mut screen = StashScreen::new(StashArg::Scenes, EntryId(1));
+        screen.data = fifty_scenes();
+        screen.rebuild();
+        let start = screen.test_content_key("scene:1").unwrap();
+        let end = screen.test_content_key("scene:45").unwrap();
+        let mut out = Vec::new();
+        let mut present = crate::ui::present::Present::new();
+        {
+            let mut fx = Effects::new(&mut out, MachineId::Instance(InstanceId(1)), &mut present);
+            screen.prefetch(Some(start), &mut fx);
+            assert!(!screen.state.loading);
+            screen.state.covered = true;
+            screen.prefetch(Some(end), &mut fx);
+            assert!(!screen.state.loading);
+            screen.state.covered = false;
+            screen.prefetch(Some(end), &mut fx);
+            screen.prefetch(Some(end), &mut fx);
+        }
+        assert_eq!(screen.state.page, 2);
+        assert_eq!(
+            out.iter()
+                .filter(|f| matches!(&f.fx, Fx::App(StashFx::Work(_, Work::Load { .. }))))
+                .count(),
+            1
+        );
+        assert!(out.iter().any(|f| matches!(&f.fx, Fx::App(StashFx::Work(_, Work::Load { query, .. })) if query.page == 2 && query.per_page == 50)));
+    }
+    #[test]
+    fn overlapping_append_retains_focus_and_duplicate_page_ends_prefetch() {
+        let mut screen = StashScreen::new(StashArg::Scenes, EntryId(1));
+        screen.data = fifty_scenes();
+        screen.rebuild();
+        let key = screen.test_content_key("scene:45").unwrap();
+        screen.state.append = true;
+        let mut next = data(&["50", "51", "52"]);
+        next.count = 120;
+        next.has_more = true;
+        screen.land_page(&next);
+        screen.rebuild();
+        assert_eq!(screen.data.sections[0].tiles.len(), 52);
+        assert_eq!(screen.test_content_key("scene:45"), Some(key));
+        assert!(screen.data.has_more);
+        screen.land_page(&next);
+        assert!(!screen.data.has_more);
+        assert_eq!(screen.data.sections[0].tiles.len(), 52);
+    }
+    #[test]
+    fn home_keeps_more_than_one_page_in_a_single_original_strip() {
+        let mut screen = StashScreen::home(EntryId(1));
+        screen.data = fifty_scenes();
+        let mut people = fifty_scenes().sections.remove(0);
+        people.title = "Performers".into();
+        people.portrait = true;
+        screen.data.sections.push(people);
+        screen.rebuild();
+        assert_eq!(screen.rows.len(), 1);
+        assert_eq!(screen.rows[0].tiles.len(), 50);
     }
     struct Measure;
     impl crate::ui::machine::Measure for Measure {

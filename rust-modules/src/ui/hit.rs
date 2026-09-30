@@ -9,7 +9,7 @@
 //! two, and **only the first of them is wired to the product today**:
 //!
 //! * `dpad_mode` suppresses hover until the pointer has travelled `DPAD_TRAVEL_PX` since the last
-//!   D-pad press. Live: `Dispatcher`'s ingest calls [`HitMap::note_dpad`] on every direction key.
+//!   D-pad press. Physical direction keys enable this gate; wheel input immediately restores hover.
 //! * `suppressed` is the fading-surface gate — below an alpha threshold a surface should answer
 //!   no hover and no click at all. **The mechanism exists and nothing sets it**: outside this
 //!   module's own unit test, `suppressed` is written nowhere, because no container feeds a
@@ -117,6 +117,11 @@ impl<K: Copy + Eq> HitMap<K> {
     pub fn note_dpad(&mut self) {
         self.dpad_mode = true;
         self.dpad_at = self.last;
+    }
+
+    /// An explicit pointer activation, including the Magic Remote's scroll wheel.
+    pub fn note_pointer(&mut self) {
+        self.dpad_mode = false;
     }
 
     /// Resolve only the current input owner's stops. Covered entries may still be drawn, but

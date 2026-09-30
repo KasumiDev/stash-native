@@ -60,7 +60,7 @@ Download the debug `.ipk` from the verified GitHub Actions artifact and extract 
 
 In webOS Dev Manager, use your existing rooted-TV connection, choose **Install**, and select the downloaded `.ipk`. Wait for installation to finish, then open **StashNative debug** on the TV and enter your Stash URL and optional key in Settings. This is an app installation; these steps do not install or update TV firmware. Exact webOS 4.4.0 compatibility still needs your device test.
 
-The assistant has not deployed, installed, or driven your TV. Device results remain unverified. Start with browsing, focus and Back navigation. For playback/history tests, use only your dedicated test scene; do not test counters on content whose records you want to preserve.
+The startup playback fix was tested on your TV, and you confirmed playback works. New cursor, pagination, and animation changes need their own device checks; that playback result does not establish their performance. Start with browsing, focus and Back navigation. For playback/history tests, use only authorized test scenes; do not test counters on content whose records you want to preserve.
 
 For developers using repository TV commands later, read the [TV session skill](../.agents/skills/tv-session/SKILL.md) and acquire the [repository TV lock](../.agents/skills/tv-lock/SKILL.md) only around device operations. Stable publication remains separate.
 

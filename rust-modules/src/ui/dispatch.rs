@@ -863,9 +863,16 @@ where
                     self.input.keyboard_owner = None;
                     self.input.cancel_press();
                 }
-                InputKind::Key { key, edge, .. } => {
+                InputKind::Key { key, edge, sym, wcode, .. } => {
                     if matches!(key, Key::Up | Key::Down | Key::Left | Key::Right) && edge == Edge::Down {
-                        self.input.hit.note_dpad();
+                        // The SDL wheel bridge emits symbol-less direction edges. It scrolls
+                        // the same containers, but must leave hover active. Scripted D-pad
+                        // events also omit symbols, so the ingress source matters here.
+                        if ev.source == super::machine::Source::Sdl && sym == 0 && wcode == 0 {
+                            self.input.hit.note_pointer();
+                        } else {
+                            self.input.hit.note_dpad();
+                        }
                     }
                     if key == Key::Ok {
                         match edge {

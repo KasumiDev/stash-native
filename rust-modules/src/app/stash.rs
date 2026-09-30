@@ -407,23 +407,6 @@ unsafe fn run_inner() -> c_int {
                     if wcode == 505 && edge == Edge::Down {
                         running = false;
                     }
-                    let key = match sym {
-                        1073741906 => Key::Up,
-                        1073741905 => Key::Down,
-                        1073741904 => Key::Left,
-                        1073741903 => Key::Right,
-                        13 => Key::Ok,
-                        27 | 8 => Key::Back,
-                        _ => match wcode {
-                            82 => Key::Up,
-                            81 => Key::Down,
-                            80 => Key::Left,
-                            79 => Key::Right,
-                            40 => Key::Ok,
-                            482 => Key::Back,
-                            _ => Key::Other,
-                        },
-                    };
                     if sym == 8 && edge != Edge::Up {
                         inputs.push(InputEvent {
                             at: tick,
@@ -431,14 +414,24 @@ unsafe fn run_inner() -> c_int {
                             kind: InputKind::Text(TextEdit::Backspace),
                         });
                     } else {
-                        let _ = key;
-                        inputs.push(super::bridge::key_input(
+                        let input = super::bridge::key_input(
                             sym,
                             wcode,
                             if kind == SDL_KEYUP { 0 } else { state },
                             tick,
                             Source::Sdl,
-                        ));
+                        );
+                        if matches!(
+                            input.kind,
+                            InputKind::Key {
+                                key: Key::Up | Key::Down | Key::Left | Key::Right,
+                                edge: Edge::Down,
+                                ..
+                            }
+                        ) {
+                            boot::hide_cursor();
+                        }
+                        inputs.push(input);
                     }
                 }
                 SDL_TEXTINPUT => {
@@ -457,6 +450,10 @@ unsafe fn run_inner() -> c_int {
                     } else {
                         events::rd_u32(&event, 20) as i32
                     };
+                    if dy != 0 {
+                        unsafe { boot::show_cursor() };
+                        dispatcher.input.hit.note_pointer();
+                    }
                     inputs.extend(pointer.wheel(dy, tick));
                 }
                 _ => {}
@@ -991,6 +988,55 @@ mod tests {
         assert!(
             dispatcher.input.arm.is_none(),
             "one pointer click commits once"
+        );
+    }
+    #[test]
+    fn wheel_restores_hover_after_dpad_without_pointer_travel() {
+        let _lock = crate::testlock::serial();
+        let mut rig = TestRig {
+            mount: Mount,
+            config: Config::default(),
+            textures: HashMap::new(),
+            work: Vec::new(),
+            playback: PlaybackView::default(),
+        };
+        let mut dispatcher = Dispatcher::<StashHost>::new();
+        dispatcher.request(MachineId::Nav, NavOp::Root(StashArg::Scenes));
+        let at = Tick {
+            ms: 1000,
+            dt_us: 16000,
+        };
+        dispatcher.frame_with(&mut rig, at, Vec::new(), Vec::new(), &mut NoTap, false);
+        dispatcher.input.hit.note_dpad();
+        dispatcher.frame_with(
+            &mut rig,
+            at,
+            super::super::bridge::wheel_input(-1, at),
+            Vec::new(),
+            &mut NoTap,
+            false,
+        );
+        assert!(
+            !dispatcher.input.hit.dpad_mode,
+            "wheel must activate hover immediately"
+        );
+        dispatcher.frame_with(
+            &mut rig,
+            at,
+            vec![super::super::bridge::key_input(
+                1073741905,
+                81,
+                1,
+                at,
+                Source::Sdl,
+            )],
+            Vec::new(),
+            &mut NoTap,
+            false,
+        );
+        assert!(
+            dispatcher.input.hit.dpad_mode,
+            "physical D-pad must suppress stray hover"
         );
     }
     #[test]

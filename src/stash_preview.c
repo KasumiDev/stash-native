@@ -21,10 +21,16 @@
 struct preview {
  void *libs[4]; AVFormatContext *fmt; AVIOContext *io; AVCodecContext *codec;
  AVPacket *packet; AVFrame *frame; struct SwsContext *scale; int stream, sw, sh, sf, draining;
+ int64_t origin_ms, output_frames; int have_origin;
 #define FIELD(n) __typeof__(&n) n;
  API_LIST(FIELD)
 #undef FIELD
 };
+/* Rotation does not change the decoded reference-frame budget. Limit pixel area,
+ * rather than rejecting a portrait solely because its height exceeds 720. */
+static int preview_raster(int width, int height) {
+ return width>0 && height>0 && width<=1280 && height<=1280 && (int64_t)width*height<=1280*720;
+}
 /* The reservation assumes 8-bit software frames. Reject hardware/unknown/high-depth formats
  * rather than treating a 10/12-bit reference frame as an 8-bit allocation. */
 static int preview_format(struct preview *p, int format) {
@@ -72,7 +78,7 @@ void *stash_preview_open(const char *dir, void *source, stash_read_fn read, stas
  for(unsigned i=0;i<count;i++) {
   AVCodecParameters *par=p->fmt->streams[i]->codecpar;
   if(par->codec_type!=AVMEDIA_TYPE_VIDEO) continue;
-  if(par->width>1280||par->height>720||par->bits_per_raw_sample>8) goto fail;
+  if((par->width>0&&par->height>0&&!preview_raster(par->width,par->height))||par->bits_per_raw_sample>8) goto fail;
   if(par->format>=0&&!preview_format(p,par->format)) goto fail;
  }
  AVDictionary **options=calloc(count?count:1,sizeof(*options));if(!options) goto fail;
@@ -91,7 +97,7 @@ void *stash_preview_open(const char *dir, void *source, stash_read_fn read, stas
  const AVCodec *codec=NULL; p->stream=p->av_find_best_stream(p->fmt,AVMEDIA_TYPE_VIDEO,-1,-1,&codec,0);
  if(p->stream<0 || !codec) goto fail;
  AVCodecParameters *par=p->fmt->streams[p->stream]->codecpar;
- if(par->width<1||par->height<1||par->width>1280||par->height>720||!preview_format(p,par->format)) goto fail;
+ if(!preview_raster(par->width,par->height)||!preview_format(p,par->format)) goto fail;
  p->codec=p->avcodec_alloc_context3(codec); if(!p->codec) goto fail;
  p->codec->thread_count=1;
  p->codec->max_pixels=1280*720;
@@ -108,7 +114,7 @@ int stash_preview_next(void *decoder,uint8_t *rgba,int *width,int *height,int64_
   if(r!=AVERROR(EAGAIN)&&r!=AVERROR_EOF) return -1;
   if(p->draining){
    if(r!=AVERROR_EOF||p->av_seek_frame(p->fmt,p->stream,0,AVSEEK_FLAG_BACKWARD)<0) return -1;
-   p->avcodec_flush_buffers(p->codec);p->draining=0;return 0;
+   p->avcodec_flush_buffers(p->codec);p->draining=0;p->have_origin=0;p->output_frames=0;return 0;
   }
   if(p->av_read_frame(p->fmt,p->packet)<0){
    if(p->avcodec_send_packet(p->codec,NULL)<0) return -1;
@@ -117,9 +123,17 @@ int stash_preview_next(void *decoder,uint8_t *rgba,int *width,int *height,int64_
   int send=0; if(p->packet->stream_index==p->stream) send=p->avcodec_send_packet(p->codec,p->packet);
   p->av_packet_unref(p->packet); if(send<0&&send!=AVERROR(EAGAIN)) return -1;
  }
- AVFrame *f=p->frame; if(f->width<1||f->height<1||f->width>1280||f->height>720||!preview_format(p,f->format)) return -1;
+ AVFrame *f=p->frame; if(!preview_raster(f->width,f->height)||!preview_format(p,f->format)) return -1;
+ *pts_ms=f->best_effort_timestamp==AV_NOPTS_VALUE?p->output_frames*1000/15:(int64_t)(f->best_effort_timestamp*av_q2d(p->fmt->streams[p->stream]->time_base)*1000);
+ if(!p->have_origin){p->origin_ms=*pts_ms;p->have_origin=1;}
+ /* Fixed rational deadlines avoid a rounded 67 ms interval rejecting the next
+  * 30 fps frame at 133 ms. Skip conversion, not reference-frame decoding. */
+ if(*pts_ms-p->origin_ms<p->output_frames*1000/15) return 2;
+ p->output_frames++;
  double ratio=640.0/f->width; if(360.0/f->height<ratio) ratio=360.0/f->height; if(ratio>1) ratio=1;
  *width=(int)(f->width*ratio); *height=(int)(f->height*ratio);
+ if(*width<1) *width=1;
+ if(*height<1) *height=1;
  if(!p->scale||p->sw!=f->width||p->sh!=f->height||p->sf!=f->format){
   if(p->scale) p->sws_freeContext(p->scale);
   p->scale=p->sws_getContext(f->width,f->height,f->format,*width,*height,AV_PIX_FMT_RGBA,SWS_FAST_BILINEAR,NULL,NULL,NULL);
@@ -128,6 +142,5 @@ int stash_preview_next(void *decoder,uint8_t *rgba,int *width,int *height,int64_
  if(!p->scale) return -1;
  uint8_t *out[]={rgba,NULL,NULL,NULL}; int stride[]={*width*4,0,0,0};
  if(p->sws_scale(p->scale,(const uint8_t *const *)f->data,f->linesize,0,f->height,out,stride)<0) return -1;
- *pts_ms=f->best_effort_timestamp==AV_NOPTS_VALUE?0:(int64_t)(f->best_effort_timestamp*av_q2d(p->fmt->streams[p->stream]->time_base)*1000);
  return 1;
 }

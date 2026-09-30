@@ -239,6 +239,8 @@ pub(crate) fn warm_tex_on(
 /// (the same thumbnail, but its EMPTY case draws a person glyph rather than a blank tile).
 pub(crate) enum Art<'a> {
     Poster(Option<&'a PmsMovie>),
+    /// Provider-neutral decoded artwork, using the same card composite and motion admission.
+    Texture { key: &'a str, image: Option<(u32, f32, f32)>, portrait: bool },
     /// **A landscape tile of a real catalog row** — an episode's own still, with the watched disc
     /// and (through `card_row::resume_bar`) the resume bar a poster wears.
     ///
@@ -271,12 +273,17 @@ pub(crate) enum Art<'a> {
 impl Art<'_> {
     fn motion_identity(&self) -> Option<crate::ui::card_motion::Identity> {
         use std::hash::{Hash, Hasher};
+        if let Self::Texture { key, .. } = self {
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            key.hash(&mut hash);
+            return Some(crate::ui::card_motion::Identity { owner: key.as_ptr() as usize, asset: hash.finish() });
+        }
         let (owner, sid, key, kind) = match self {
             Self::Poster(Some(m)) => (*m as *const PmsMovie as usize, m.sid, m.thumb.as_str(), 0u8),
             Self::Still(Some(m)) => (*m as *const PmsMovie as usize, m.sid, still_key(m), 1),
             Self::Thumb { sid, key, .. } => (key.as_ptr() as usize, *sid, *key, 2),
             Self::Person { sid, key, .. } => (key.as_ptr() as usize, *sid, *key, 3),
-            Self::Poster(None) | Self::Still(None) => return None,
+            Self::Poster(None) | Self::Still(None) | Self::Texture { .. } => return None,
         };
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         (sid.raw(), key, kind).hash(&mut hash);
@@ -580,8 +587,8 @@ pub(crate) fn art_uv(art: &Art, tw: f32, th: f32, r: Rect) -> [f32; 4] {
 /// portrait source going into a circle; every other variant is even.
 pub(crate) fn art_crop(art: &Art) -> crate::ui::Crop {
     match art {
-        Art::Person { .. } => crate::ui::Crop::Headshot,
-        Art::Poster(_) | Art::Still(_) | Art::Thumb { .. } => crate::ui::Crop::Centre,
+        Art::Person { .. } | Art::Texture { portrait: true, .. } => crate::ui::Crop::Headshot,
+        Art::Poster(_) | Art::Still(_) | Art::Thumb { .. } | Art::Texture { portrait: false, .. } => crate::ui::Crop::Centre,
     }
 }
 
@@ -594,6 +601,7 @@ pub(crate) fn resolve_card_art(p: Painter, rect: Rect, art: &Art<'_>) -> (u32, f
     let _admission = art.motion_identity()
         .map(|id| crate::ui::card_motion::Scope::card(id, p.to_screen(rect).0));
     let image = match art {
+        Art::Texture { image, .. } => image.unwrap_or((0, 0.0, 0.0)),
         Art::Poster(m) => m.map(|m| resolve_tex_wh_on(m.sid, &m.thumb, POSTER_RES.0, POSTER_RES.1, 0)).unwrap_or((0, 0.0, 0.0)),
         Art::Still(m) => m.map(|m| resolve_tex_wh_on(m.sid, still_key(m), STILL_RES.0, STILL_RES.1, 0)).unwrap_or((0, 0.0, 0.0)),
         Art::Thumb { sid, key, res } | Art::Person { sid, key, res } => resolve_tex_wh_on(*sid, key, res.0, res.1, 0),
@@ -628,6 +636,14 @@ pub(crate) fn card_named(p: Painter, frame: Rect, art: Art, name: Option<&str>, 
     // screen nor its springs can forget to report a new positional expression.
     let image = resolve_card_art(p, r, &art);
     match art {
+        Art::Texture { .. } => {
+            let (t, tw, th) = image;
+            if t != 0 {
+                p.tex_carded(t, art_uv(&art, tw, th, r), r, rad, theme::TINT_WHITE, f);
+            } else {
+                p.rrect_sheened(r, rad, theme::CARD_PLACEHOLDER);
+            }
+        }
         Art::Poster(m) => {
             // **The ROW's server, not the current one.** A `thumb` path is a key on the server that
             // issued it — image-transcode paths embed a server-local ratingKey — so a bare

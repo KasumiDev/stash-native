@@ -39,7 +39,6 @@ pub enum Action {
     Open(StashArg),
     Play(Scene, bool),
     Refresh,
-    More,
     Sort,
     EditSearch,
     Pause,
@@ -86,6 +85,8 @@ pub struct PageData {
     pub scene: Option<Scene>,
     pub sections: Vec<Section>,
     pub count: usize,
+    /// Further catalog results exist after this response page.
+    pub has_more: bool,
     pub images: Vec<Image>,
     pub lazy_tags: Vec<Tag>,
 }
@@ -181,7 +182,8 @@ impl Worker {
 }
 /// Synthetic route data for simulator verification; no Stash requests or writes are made.
 fn fixture(route: &StashArg, query: &Query) -> PageData {
-    let performers: Vec<_> = (1..=8)
+    let paged = std::env::var_os("STASH_FIXTURE_PAGES").is_some();
+    let performers: Vec<_> = (1..=if paged { 108 } else { 8 })
         .map(|id| Performer {
             id: id.to_string(),
             name: format!("Performer {id}"),
@@ -190,7 +192,7 @@ fn fixture(route: &StashArg, query: &Query) -> PageData {
             image_path: Some(format!("fixture://performer/{id}")),
         })
         .collect();
-    let tags: Vec<_> = (1..=3)
+    let tags: Vec<_> = (1..=if paged { 70 } else { 3 })
         .map(|id| Tag {
             id: id.to_string(),
             name: format!("Tag {id}"),
@@ -198,7 +200,7 @@ fn fixture(route: &StashArg, query: &Query) -> PageData {
             ..Default::default()
         })
         .collect();
-    let scenes: Vec<_> = (1..=12)
+    let scenes: Vec<_> = (1..=if paged { 120 } else { 12 })
         .map(|id| Scene {
             id: id.to_string(),
             title: Some(format!("Scene {id}")),
@@ -217,7 +219,7 @@ fn fixture(route: &StashArg, query: &Query) -> PageData {
             ..Default::default()
         })
         .collect();
-    let images: Vec<_> = (1..=10)
+    let images: Vec<_> = (1..=if paged { 110 } else { 10 })
         .map(|id| Image {
             id: id.to_string(),
             title: Some(format!("Image {id}")),
@@ -227,7 +229,7 @@ fn fixture(route: &StashArg, query: &Query) -> PageData {
             },
         })
         .collect();
-    let galleries: Vec<_> = (1..=4)
+    let galleries: Vec<_> = (1..=if paged { 64 } else { 4 })
         .map(|id| Gallery {
             id: id.to_string(),
             title: Some(format!("Gallery {id}")),
@@ -243,10 +245,10 @@ fn fixture(route: &StashArg, query: &Query) -> PageData {
     };
     match route {
         StashArg::Home => {
-            data.scenes = scenes.clone();
+            data.scenes = scenes.iter().take(12).cloned().collect();
             data.sections.push(section(
                 "Newest scenes",
-                scenes.clone().into_iter().map(scene).collect(),
+                data.scenes.iter().cloned().map(scene).collect(),
                 false,
             ));
             data.sections.push(section(
@@ -362,6 +364,37 @@ fn fixture(route: &StashArg, query: &Query) -> PageData {
         }
         StashArg::Settings | StashArg::Player(_) => {}
     }
+    if !matches!(
+        route,
+        StashArg::Scene(_) | StashArg::Viewer { .. } | StashArg::Settings | StashArg::Player(_)
+    ) {
+        data.count = 0;
+        let offset = query.page.saturating_sub(1) as usize * query.per_page as usize;
+        for section in &mut data.sections {
+            if matches!(route, StashArg::Home) && section.title != "Performers" {
+                continue;
+            }
+            let count = section.tiles.len();
+            data.count += count;
+            data.has_more |= page_has_more(query, count);
+            section.tiles = section
+                .tiles
+                .iter()
+                .skip(offset)
+                .take(query.per_page as usize)
+                .cloned()
+                .collect();
+        }
+        if matches!(route, StashArg::Gallery(_)) {
+            data.images = data
+                .images
+                .into_iter()
+                .skip(offset)
+                .take(query.per_page as usize)
+                .collect();
+        }
+    }
+
     data
 }
 fn scene(s: Scene) -> Tile {
@@ -426,6 +459,10 @@ fn section(title: &str, tiles: Vec<Tile>, portrait: bool) -> Section {
 fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
+fn page_has_more(query: &Query, count: usize) -> bool {
+    (query.page.max(1) as usize).saturating_mul(query.per_page as usize) < count
+}
+
 fn load(c: &Client, r: &StashArg, q: &Query) -> Result<PageData, String> {
     let mut out = PageData {
         title: r.label().into(),
@@ -446,21 +483,23 @@ fn load(c: &Client, r: &StashArg, q: &Query) -> Result<PageData, String> {
                 false,
             ));
             let favorites = Query {
-                per_page: 24,
+                page: q.page,
+                per_page: 50,
                 sort: "o_counter".into(),
                 direction: Direction::Descending,
                 ..Default::default()
             };
+            let people = c.favorite_performers(&favorites).map_err(err)?;
+            out.count = people.count;
+            out.has_more = page_has_more(&favorites, people.count);
             out.sections.push(section(
                 "Performers",
-                c.favorite_performers(&favorites)
-                    .map_err(err)?
-                    .items
-                    .into_iter()
-                    .map(performer)
-                    .collect(),
+                people.items.into_iter().map(performer).collect(),
                 true,
             ));
+            if q.page > 1 {
+                return Ok(out);
+            }
             let mut tags = c
                 .tags(
                     &Query {
@@ -489,6 +528,7 @@ fn load(c: &Client, r: &StashArg, q: &Query) -> Result<PageData, String> {
         StashArg::Scenes | StashArg::Search => {
             let page = c.scenes(q).map_err(err)?;
             out.count = page.count;
+            out.has_more = page_has_more(q, page.count);
             out.sections.push(section(
                 "Scenes",
                 page.items.into_iter().map(scene).collect(),
@@ -498,6 +538,7 @@ fn load(c: &Client, r: &StashArg, q: &Query) -> Result<PageData, String> {
         StashArg::Performers => {
             let page = c.favorite_performers(q).map_err(err)?;
             out.count = page.count;
+            out.has_more = page_has_more(q, page.count);
             out.sections.push(section(
                 "Performers",
                 page.items.into_iter().map(performer).collect(),
@@ -507,6 +548,7 @@ fn load(c: &Client, r: &StashArg, q: &Query) -> Result<PageData, String> {
         StashArg::Galleries => {
             let page = c.galleries(q).map_err(err)?;
             out.count = page.count;
+            out.has_more = page_has_more(q, page.count);
             out.sections.push(section(
                 "Galleries",
                 page.items.into_iter().map(gallery).collect(),
@@ -516,6 +558,7 @@ fn load(c: &Client, r: &StashArg, q: &Query) -> Result<PageData, String> {
         StashArg::Tags => {
             let page = c.tags(q, None).map_err(err)?;
             out.count = page.count;
+            out.has_more = page_has_more(q, page.count);
             out.sections.push(section(
                 "Tags",
                 page.items.into_iter().map(tag).collect(),
@@ -572,24 +615,18 @@ fn load(c: &Client, r: &StashArg, q: &Query) -> Result<PageData, String> {
                 out.title = c.tag(id).map_err(err)?.name;
                 query.tag_id = Some(id.clone());
             }
+            let scenes = c.scenes(&query).map_err(err)?;
+            let galleries = c.galleries(&query).map_err(err)?;
+            out.count = scenes.count + galleries.count;
+            out.has_more = page_has_more(q, scenes.count) || page_has_more(q, galleries.count);
             out.sections.push(section(
                 "Scenes",
-                c.scenes(&query)
-                    .map_err(err)?
-                    .items
-                    .into_iter()
-                    .map(scene)
-                    .collect(),
+                scenes.items.into_iter().map(scene).collect(),
                 false,
             ));
             out.sections.push(section(
                 "Galleries",
-                c.galleries(&query)
-                    .map_err(err)?
-                    .items
-                    .into_iter()
-                    .map(gallery)
-                    .collect(),
+                galleries.items.into_iter().map(gallery).collect(),
                 false,
             ));
         }
@@ -607,6 +644,7 @@ fn load(c: &Client, r: &StashArg, q: &Query) -> Result<PageData, String> {
                 }
             }
             out.count = page.count;
+            out.has_more = page_has_more(q, page.count);
             out.images = page.items.clone();
             let tiles = page
                 .items
@@ -629,4 +667,20 @@ fn load(c: &Client, r: &StashArg, q: &Query) -> Result<PageData, String> {
         StashArg::Settings | StashArg::Player(_) => {}
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod pagination_tests {
+    use super::*;
+    #[test]
+    fn page_boundary_and_last_partial_page_are_terminal() {
+        let query = Query {
+            page: 1,
+            per_page: 50,
+            ..Default::default()
+        };
+        assert!(!page_has_more(&query, 50));
+        assert!(page_has_more(&query, 51));
+        assert!(!page_has_more(&Query { page: 2, ..query }, 51));
+    }
 }

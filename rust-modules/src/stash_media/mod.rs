@@ -11,7 +11,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 pub(crate) mod playback;
 const BUDGET: usize = 64 * 1024 * 1024;
-const ASSET_LIMIT: usize = 8 * 1024 * 1024;
+const ASSET_LIMIT: usize = 32 * 1024 * 1024;
 const WORKERS: usize = 32;
 const PREVIEW_LIMIT: i64 = 32 * 1024 * 1024;
 fn reserve_counter(counter: &AtomicUsize, bytes: usize, limit: usize) -> bool {
@@ -282,13 +282,8 @@ fn wait(stop: &AtomicBool, delay: Duration) {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
-fn webp_frames(
-    bytes: &[u8],
-    budget: &Arc<AtomicUsize>,
-) -> Option<(Vec<image::Frame>, Vec<Allocation>)> {
+fn webp_decoder(bytes: &[u8]) -> Option<image::codecs::webp::WebPDecoder<std::io::Cursor<&[u8]>>> {
     let mut decoder = image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(bytes)).ok()?;
-    // image-webp deliberately ignores disposal clears unless a background is configured.
-    // ANIM encodes BGRA; configure the canvas explicitly to honor disposal and alpha.
     let mut at: usize = 12;
     let mut background = [0, 0, 0, 0];
     while at + 8 <= bytes.len() {
@@ -307,33 +302,115 @@ fn webp_frames(
     if decoder.has_animation() {
         decoder.set_background_color(image::Rgba(background)).ok()?;
     }
+    Some(decoder)
+}
+struct WebpStream<'a> {
+    frames: image::Frames<'a>,
+    _working: Allocation,
+}
+fn webp_stream<'a>(bytes: &'a [u8], budget: &Arc<AtomicUsize>) -> Option<WebpStream<'a>> {
+    let decoder = webp_decoder(bytes)?;
     let (w, h) = decoder.dimensions();
     let size = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
     if w > 4096 || h > 4096 || size > 16 * 1024 * 1024 {
         return None;
     }
-    let composite = Allocation::reserve(budget, size.saturating_mul(3))?;
-    let mut frames = Vec::new();
-    let mut allocations = vec![composite];
-    let mut truncated = false;
-    for frame in decoder.into_frames() {
-        let Some(allocation) = Allocation::reserve(budget, size) else {
-            truncated = true;
-            break;
+    // Decoder canvas, previous disposal canvas, emitted frame and conversion work.
+    // Frame count does not change the allocation: a long animation stays streaming.
+    let working = Allocation::reserve(budget, size.checked_mul(4)?)?;
+    Some(WebpStream {
+        frames: decoder.into_frames(),
+        _working: working,
+    })
+}
+fn animation_frame(
+    key: &str,
+    frame: image::Frame,
+    budget: &Arc<AtomicUsize>,
+) -> Option<MediaFrame> {
+    let image = image::DynamicImage::ImageRgba8(frame.into_buffer());
+    let (w, h) = (image.width().min(320), image.height().min(480));
+    let mut allocation = Allocation::reserve(
+        budget,
+        (w as usize).checked_mul(h as usize)?.checked_mul(8)?,
+    )?;
+    let thumbnail = image.thumbnail(w, h).into_rgba8();
+    let (width, height) = thumbnail.dimensions();
+    let rgba = thumbnail.into_raw();
+    allocation.shrink_to(rgba.capacity());
+    Some(MediaFrame {
+        key: key.into(),
+        width,
+        height,
+        rgba,
+        _allocation: Some(Arc::new(vec![allocation])),
+    })
+}
+fn play_webp(
+    key: &str,
+    bytes: &[u8],
+    stop: &AtomicBool,
+    tx: &mpsc::SyncSender<MediaFrame>,
+    budget: &Arc<AtomicUsize>,
+) -> bool {
+    let clock = Instant::now();
+    let mut deadline = Duration::ZERO;
+    let mut presentations = 0u64;
+    loop {
+        let Some(mut stream) = webp_stream(bytes, budget) else {
+            return false;
         };
-        let frame = frame.ok()?;
-        allocations.push(allocation);
-        frames.push(frame);
-        if frames.len() >= 256 {
-            truncated = true;
-            break;
+        let mut count = 0;
+        for frame in &mut stream.frames {
+            if stop.load(Ordering::Acquire) {
+                return true;
+            }
+            let Ok(frame) = frame else {
+                return false;
+            };
+            let (numerator, denominator) = frame.delay().numer_denom_ms();
+            let delay =
+                Duration::from_millis((numerator as u64 / denominator.max(1) as u64).max(10));
+            count += 1;
+            if webp_decode_late(clock.elapsed(), deadline.saturating_add(delay)) {
+                eprintln!(
+                    "[stash-media] animated portrait cannot maintain timing; using still image"
+                );
+                return false;
+            }
+            // Composite every frame, but do not enqueue an obsolete presentation.
+            if let Some(present_at) = webp_presentation_at(deadline, delay, presentations)
+                .filter(|_| clock.elapsed() < deadline.saturating_add(delay))
+            {
+                let Some(frame) = animation_frame(key, frame, budget) else {
+                    return false;
+                };
+                wait(stop, present_at.saturating_sub(clock.elapsed()));
+                if !deliver(tx, stop, frame) {
+                    return true;
+                }
+                // Advance absolute presentation slots, rather than adding 67 ms
+                // to each selected frame (which quantizes 30 fps input to 10 fps).
+                presentations = webp_next_slot(present_at);
+            }
+            deadline = deadline.saturating_add(delay);
+        }
+        wait(stop, deadline.saturating_sub(clock.elapsed()));
+        if count < 2 || stop.load(Ordering::Acquire) {
+            return true;
         }
     }
-    if truncated {
-        frames.truncate(1);
-        allocations.truncate(2);
-    }
-    (!frames.is_empty()).then_some((frames, allocations))
+}
+fn webp_presentation_at(start: Duration, delay: Duration, presentations: u64) -> Option<Duration> {
+    let slot = Duration::from_millis(presentations.saturating_mul(1000) / 15);
+    let at = start.max(slot);
+    (at < start.saturating_add(delay)).then_some(at)
+}
+fn webp_next_slot(at: Duration) -> u64 {
+    ((at.as_millis() + 1) * 15).div_ceil(1000) as u64
+}
+fn webp_decode_late(elapsed: Duration, frame_end: Duration) -> bool {
+    elapsed > frame_end.saturating_add(Duration::from_millis(500))
 }
 #[cfg_attr(test, allow(dead_code))]
 struct Source {
@@ -492,53 +569,39 @@ fn decode_image(
         return;
     }
     let encoded_limit = source.size as usize;
-    let Some(_encoded_allocation) = reserve_or_retry(budget, encoded_limit, blocked) else {
-        return;
-    };
-    let mut bytes = Vec::with_capacity(encoded_limit);
-    let mut chunk = [0u8; 8192];
-    loop {
-        let n = source.read(&mut chunk);
-        if n < 0 {
+    let (bytes, _encoded_allocation) = if let Some(bytes) = source.bytes.take() {
+        // HTTPS already owns its response. Transfer its permit with the bytes;
+        // copying a large animation briefly doubled compressed-media admission.
+        let Some(allocation) = source._allocation.take() else {
             return;
-        }
-        if n == 0 {
-            break;
-        }
-        if !append_asset_chunk(&mut bytes, &chunk[..n as usize], encoded_limit) {
+        };
+        (bytes, allocation)
+    } else {
+        let Some(allocation) = reserve_or_retry(budget, encoded_limit, blocked) else {
             return;
-        }
-    }
-    drop(source);
-    if animated && image::guess_format(&bytes).ok() == Some(image::ImageFormat::WebP) {
-        if let Some((frames, allocations)) = webp_frames(&bytes, budget) {
-            let allocations = Arc::new(allocations);
-            loop {
-                for frame in &frames {
-                    let delay = frame.delay().numer_denom_ms();
-                    if !deliver(
-                        tx,
-                        stop,
-                        MediaFrame {
-                            key: key.into(),
-                            width: frame.buffer().width(),
-                            height: frame.buffer().height(),
-                            rgba: frame.buffer().as_raw().clone(),
-                            _allocation: Some(allocations.clone()),
-                        },
-                    ) {
-                        return;
-                    }
-                    wait(
-                        stop,
-                        Duration::from_millis((delay.0 as u64 / delay.1.max(1) as u64).max(10)),
-                    );
-                }
-                if frames.len() == 1 || stop.load(Ordering::Acquire) {
-                    return;
-                }
+        };
+        let mut bytes = Vec::with_capacity(encoded_limit);
+        let mut chunk = [0u8; 8192];
+        loop {
+            let n = source.read(&mut chunk);
+            if n < 0 {
+                return;
+            }
+            if n == 0 {
+                break;
+            }
+            if !append_asset_chunk(&mut bytes, &chunk[..n as usize], encoded_limit) {
+                return;
             }
         }
+        (bytes, allocation)
+    };
+    drop(source);
+    if animated
+        && image::guess_format(&bytes).ok() == Some(image::ImageFormat::WebP)
+        && play_webp(key, &bytes, stop, tx, budget)
+    {
+        return;
     }
     if let Some(frame) = static_frame(key, &bytes, budget, blocked) {
         let _ = deliver(tx, stop, frame);
@@ -695,7 +758,6 @@ fn decode_preview(
     let mut w = 0;
     let mut h = 0;
     let mut pts = 0;
-    let mut last_pts = -67;
     let mut first_pts = None;
     let mut clock = Instant::now();
     while !stop.load(Ordering::Acquire) {
@@ -705,16 +767,17 @@ fn decode_preview(
             break;
         }
         if n == 0 {
-            last_pts = -67;
             first_pts = None;
             clock = Instant::now();
             continue;
         }
-        pts = pts.saturating_sub(*first_pts.get_or_insert(pts)).max(0);
-        if pts.saturating_sub(last_pts) < 67 {
+        if n == 2 {
             continue;
         }
-        last_pts = pts;
+        pts = pts.saturating_sub(*first_pts.get_or_insert(pts)).max(0);
+        if clock.elapsed().as_millis() > pts as u128 + 100 {
+            continue;
+        }
         if pts > 0 {
             wait(
                 stop,
@@ -937,10 +1000,172 @@ mod tests {
         bytes
     }
     #[test]
+    fn webp_presentation_cap_preserves_dependent_compositing_and_timeline() {
+        let budget = Arc::new(AtomicUsize::new(0));
+        let bytes = animation_fixture();
+        let mut stream = webp_stream(&bytes, &budget).unwrap();
+        let mut timeline = Duration::ZERO;
+        let mut presentations = 0u64;
+        let mut decoded = 0;
+        let mut displayed = 0;
+        for frame in &mut stream.frames {
+            let frame = frame.unwrap();
+            decoded += 1;
+            let (n, d) = frame.delay().numer_denom_ms();
+            let delay = Duration::from_millis((u64::from(n) / u64::from(d.max(1))).max(10));
+            if let Some(at) = webp_presentation_at(timeline, delay, presentations) {
+                displayed += 1;
+                presentations = webp_next_slot(at);
+            }
+            timeline += delay;
+            if decoded == 3 {
+                // This alpha-blended partial depends on disposal from the second
+                // frame even though that frame was not presented.
+                assert_eq!(frame.buffer().get_pixel(0, 0).0, [0, 0, 0, 0]);
+                let mixed = frame.buffer().get_pixel(2, 0).0;
+                assert!((126..=128).contains(&mixed[0]) && (127..=129).contains(&mixed[1]));
+                assert_eq!(mixed[3], 255);
+            }
+        }
+        assert_eq!(decoded, 3);
+        assert_eq!(displayed, 2);
+        assert_eq!(timeline, Duration::from_millis(120));
+        drop(stream);
+        assert_eq!(budget.load(Ordering::Acquire), 0);
+    }
+    #[test]
+    fn webp_presentation_cap_uses_absolute_fifteen_fps_slots() {
+        let mut slots = 0u64;
+        let mut selected = Vec::new();
+        for index in 0..60u64 {
+            let at = Duration::from_millis(index * 1000 / 60);
+            let end = Duration::from_millis((index + 1) * 1000 / 60);
+            if let Some(at) = webp_presentation_at(at, end - at, slots) {
+                selected.push(index);
+                slots = webp_next_slot(at);
+            }
+        }
+        assert_eq!(selected, (0..60).step_by(4).collect::<Vec<_>>());
+        assert_eq!(
+            webp_presentation_at(Duration::ZERO, Duration::from_millis(10), 1),
+            None
+        );
+        assert_eq!(
+            webp_presentation_at(Duration::from_millis(60), Duration::from_millis(60), 1),
+            Some(Duration::from_millis(66))
+        );
+        assert!(webp_presentation_at(
+            Duration::from_millis(0xFF_FFFF),
+            Duration::from_millis(10),
+            1
+        )
+        .is_some());
+    }
+    #[test]
+    fn short_webp_plays_composited_frame_at_slot_and_keeps_slots_across_loops() {
+        let bytes = animation_fixture();
+        let budget = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(1);
+        let worker_stop = stop.clone();
+        let worker_budget = budget.clone();
+        let clock = Instant::now();
+        let worker = std::thread::spawn(move || {
+            play_webp("portrait", &bytes, &worker_stop, &tx, &worker_budget)
+        });
+        let first = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(&first.rgba[..4], &[255, 0, 0, 255]);
+        let second = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(clock.elapsed() >= Duration::from_millis(60));
+        assert_eq!(&second.rgba[..4], &[0, 0, 0, 0]);
+        assert!((126..=128).contains(&second.rgba[8]));
+        assert!((127..=129).contains(&second.rgba[9]));
+        assert_eq!(second.rgba[11], 255);
+        let third = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Loop two starts at 120 ms, but its first frame waits for slot 133 ms.
+        assert!(clock.elapsed() >= Duration::from_millis(120));
+        assert_eq!(&third.rgba[..4], &[255, 0, 0, 255]);
+        stop.store(true, Ordering::Release);
+        assert!(worker.join().unwrap());
+        drop((first, second, third, rx));
+        assert_eq!(budget.load(Ordering::Acquire), 0);
+    }
+    #[test]
+    fn webp_decode_lag_falls_back_before_an_entire_loop_is_dropped() {
+        let end = Duration::from_millis(17);
+        assert!(!webp_decode_late(Duration::from_millis(517), end));
+        assert!(webp_decode_late(Duration::from_millis(518), end));
+        assert!(!webp_decode_late(
+            Duration::from_millis(14_000),
+            Duration::from_millis(14_066)
+        ));
+    }
+    #[test]
+    fn long_webp_animation_streams_without_a_frame_count_memory_limit() {
+        let mut payload = b"WEBP".to_vec();
+        payload.extend(chunk(b"VP8X", &[0x12, 0, 0, 0, 2, 0, 0, 0, 0, 0]));
+        payload.extend(chunk(b"ANIM", &[0, 0, 0, 0, 0, 0]));
+        for index in 0..300 {
+            payload.extend(frame_chunk(3, 0, [index as u8, 0, 0, 255], 17, 2));
+        }
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend(payload);
+        let budget = Arc::new(AtomicUsize::new(BUDGET - 1024));
+        let mut stream = webp_stream(&bytes, &budget).unwrap();
+        for index in 0..300 {
+            let frame = stream.frames.next().unwrap().unwrap();
+            assert_eq!(frame.buffer().get_pixel(0, 0).0, [index as u8, 0, 0, 255]);
+            let output = animation_frame("portrait", frame, &budget).unwrap();
+            assert_eq!(output.rgba[0], index as u8);
+            drop(output);
+            assert_eq!(budget.load(Ordering::Acquire), BUDGET - 1024 + 48);
+        }
+        assert!(stream.frames.next().is_none());
+        drop(stream);
+        assert_eq!(budget.load(Ordering::Acquire), BUDGET - 1024);
+    }
+    #[test]
+    fn performer_assets_larger_than_eight_mib_have_bounded_admission() {
+        assert!(ASSET_LIMIT >= 15 * 1024 * 1024);
+        assert!(ASSET_LIMIT <= BUDGET / 2);
+    }
+    #[test]
+    #[ignore = "optional private diagnostic; no private media is tracked"]
+    fn private_webp_stream_probe() {
+        let path = std::env::var_os("STASH_WEBP_PROBE_PATH").expect("set STASH_WEBP_PROBE_PATH");
+        let bytes = std::fs::read(path).unwrap();
+        let budget = Arc::new(AtomicUsize::new(0));
+        let encoded = Allocation::reserve(&budget, bytes.capacity()).unwrap();
+        let mut stream = webp_stream(&bytes, &budget).unwrap();
+        let clock = Instant::now();
+        let mut count = 0;
+        let mut peak = 0;
+        let mut duration = 0u64;
+        for frame in &mut stream.frames {
+            let frame = frame.unwrap();
+            let (n, d) = frame.delay().numer_denom_ms();
+            duration += n as u64 / d.max(1) as u64;
+            let output = animation_frame("private", frame, &budget).unwrap();
+            assert!(output.width <= 320 && output.height <= 480);
+            peak = peak.max(budget.load(Ordering::Acquire));
+            count += 1;
+        }
+        drop(stream);
+        drop(encoded);
+        assert_eq!(budget.load(Ordering::Acquire), 0);
+        println!(
+            "WebP stream: frames={count} timeline_ms={duration} decode_ms={} reserved_peak={peak}",
+            clock.elapsed().as_millis()
+        );
+    }
+    #[test]
     fn animated_webp_composites_disposal_blending_and_delays() {
         let budget = Arc::new(AtomicUsize::new(0));
         let bytes = animation_fixture();
-        let (frames, allocations) = webp_frames(&bytes, &budget).unwrap();
+        let stream = webp_stream(&bytes, &budget).unwrap();
+        let WebpStream { frames, _working } = stream;
+        let frames = frames.collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(frames.len(), 3);
         assert_eq!(
             frames
@@ -956,17 +1181,48 @@ mod tests {
         assert!((126..=128).contains(&mixed[0]) && (127..=129).contains(&mixed[1]));
         assert_eq!(mixed[3], 255);
         drop(frames);
-        drop(allocations);
+        drop(_working);
         assert_eq!(budget.load(Ordering::Acquire), 0);
     }
     #[test]
-    fn animated_webp_budget_exhaustion_retains_first_still() {
-        let budget = Arc::new(AtomicUsize::new(BUDGET - 48));
-        let (frames, allocations) = webp_frames(&animation_fixture(), &budget).unwrap();
-        assert_eq!(frames.len(), 1);
-        drop(frames);
-        drop(allocations);
-        assert_eq!(budget.load(Ordering::Acquire), BUDGET - 48);
+    fn animated_webp_canvas_over_budget_falls_back_to_still() {
+        let mut payload = b"WEBP".to_vec();
+        payload.extend(chunk(b"VP8X", &[0x12, 0, 0, 0, 0x37, 4, 0, 0x7f, 7, 0]));
+        payload.extend(chunk(b"ANIM", &[0, 0, 0, 0, 0, 0]));
+        payload.extend(frame_chunk(3, 0, [255, 0, 0, 255], 20, 2));
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend(payload);
+        let used = BUDGET - 28 * 1024 * 1024;
+        let budget = Arc::new(AtomicUsize::new(used));
+        assert!(webp_stream(&bytes, &budget).is_none());
+        let still = static_frame("portrait", &bytes, &budget, &AtomicBool::new(false)).unwrap();
+        assert_eq!((still.width, still.height), (405, 720));
+        drop(still);
+        assert_eq!(budget.load(Ordering::Acquire), used);
+    }
+    #[test]
+    fn streaming_webp_cancel_releases_working_buffers_but_preserves_queued_frame() {
+        let budget = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (worker_budget, worker_stop) = (budget.clone(), stop.clone());
+        let worker = std::thread::spawn(move || {
+            play_webp(
+                "portrait",
+                &animation_fixture(),
+                &worker_stop,
+                &tx,
+                &worker_budget,
+            )
+        });
+        let frame = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        stop.store(true, Ordering::Release);
+        assert!(worker.join().unwrap());
+        drop(rx);
+        assert_eq!(budget.load(Ordering::Acquire), frame.rgba.capacity());
+        drop(frame);
+        assert_eq!(budget.load(Ordering::Acquire), 0);
     }
     #[test]
     fn cancel_discards_queued_stale_preview() {
@@ -1052,39 +1308,63 @@ mod tests {
             return;
         }
         let dir = CString::new(directory.to_string_lossy().as_bytes()).unwrap();
-        let mut source = Memory {
-            bytes: include_bytes!("fixtures/preview.mp4"),
-            at: 0,
-        };
-        let decoder = unsafe {
-            stash_preview_open(
-                dir.as_ptr(),
-                (&mut source as *mut Memory).cast(),
-                read,
-                seek,
-            )
-        };
-        assert!(!decoder.is_null());
-        let mut pixels = vec![0; 640 * 360 * 4];
-        let (mut w, mut h, mut pts) = (0, 0, 0);
-        let mut loops = 0;
-        let mut frames = 0;
-        for _ in 0..32 {
-            let result = unsafe {
-                stash_preview_next(decoder, pixels.as_mut_ptr(), &mut w, &mut h, &mut pts)
+        for (bytes, expected, minimum_skips) in [
+            (
+                include_bytes!("fixtures/preview.mp4").as_slice(),
+                (320, 180),
+                0,
+            ),
+            (
+                include_bytes!("fixtures/portrait-preview.mp4").as_slice(),
+                (202, 360),
+                20,
+            ),
+        ] {
+            let mut source = Memory { bytes, at: 0 };
+            let decoder = unsafe {
+                stash_preview_open(
+                    dir.as_ptr(),
+                    (&mut source as *mut Memory).cast(),
+                    read,
+                    seek,
+                )
             };
-            assert!(result >= 0);
-            if result == 0 {
-                loops += 1;
-            } else {
-                frames += 1;
-                assert_eq!((w, h), (320, 180));
-                assert!(pixels[..w as usize * h as usize * 4]
-                    .iter()
-                    .any(|&v| v != 0));
+            assert!(!decoder.is_null());
+            let mut pixels = vec![0; 640 * 360 * 4];
+            let (mut w, mut h, mut pts) = (0, 0, 0);
+            let mut loops = 0;
+            let mut frames = 0;
+            let mut skips = 0;
+            let mut presented_pts = Vec::new();
+            for _ in 0..96 {
+                let result = unsafe {
+                    stash_preview_next(decoder, pixels.as_mut_ptr(), &mut w, &mut h, &mut pts)
+                };
+                assert!(result >= 0);
+                if result == 0 {
+                    loops += 1;
+                    // A 29.97 fps clip should present approximately every other frame,
+                    // never become the old 67-ms 2/3-frame alternation.
+                    if minimum_skips > 0 {
+                        assert!(presented_pts
+                            .windows(2)
+                            .all(|p| (60..=75).contains(&(p[1] - p[0]))));
+                    }
+                    presented_pts.clear();
+                } else if result == 2 {
+                    skips += 1;
+                } else {
+                    frames += 1;
+                    presented_pts.push(pts);
+                    assert_eq!((w, h), expected);
+                    assert!(pixels[..w as usize * h as usize * 4]
+                        .iter()
+                        .any(|&v| v != 0));
+                }
             }
+            unsafe { stash_preview_close(decoder) };
+            assert!(loops >= 2 && frames >= 12);
+            assert!(skips >= minimum_skips);
         }
-        unsafe { stash_preview_close(decoder) };
-        assert!(loops >= 2 && frames >= 12);
     }
 }
