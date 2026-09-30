@@ -348,10 +348,10 @@ impl Screen<StashHost> for HomeScreen {
                 .collect::<Vec<_>>()
                 .join(", ");
             let meta = format!(
-                "{} · {} · O {}",
+                "{} · {} · {}",
                 scene.date.as_deref().unwrap_or(""),
                 names,
-                scene.o_counter
+                crate::i18n::msg::stash_player_count(scene.o_counter)
             );
             let meta = crate::ui::text_view::TextView::new(
                 &meta,
