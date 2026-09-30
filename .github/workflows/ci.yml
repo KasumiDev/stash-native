@@ -152,6 +152,8 @@ jobs:
 
   cross-build:
     name: cross-build (armv7) + artifact assertions
+    env:
+      STASH_DEFAULT_URL: ${{ vars.STASH_DEFAULT_URL }}
     # MUST be arm64 Linux. webosbrew/native-toolchain publishes darwin-arm64, darwin-x86_64 and
     # linux-aarch64 for this release — there is NO linux-x86_64 build, so ubuntu-latest cannot
     # obtain the toolchain at all. See the Makefile's NDK bootstrap block.

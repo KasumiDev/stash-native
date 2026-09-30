@@ -11,6 +11,13 @@ pub struct Config {
 }
 
 impl Config {
+    /// A build-provided server only fills missing settings; credentials remain untouched.
+    pub fn apply_server_fallback(&mut self, fallback: &str) {
+        if self.server_url.trim().is_empty() {
+            self.server_url = fallback.to_owned();
+        }
+    }
+
     pub fn from_env() -> Self {
         Self {
             server_url: std::env::var("STASH_URL")
@@ -121,6 +128,20 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn server_fallback_only_fills_blank_settings_and_preserves_credentials() {
+        let mut config = Config {
+            server_url: "  ".into(),
+            api_key: "existing-key".into(),
+        };
+        config.apply_server_fallback("http://example.test:9999/graphql");
+        assert_eq!(config.server_url, "http://example.test:9999/graphql");
+        assert_eq!(config.api_key, "existing-key");
+        config.server_url = "http://saved.test/graphql".into();
+        config.apply_server_fallback("http://example.test:9999/graphql");
+        assert_eq!(config.server_url, "http://saved.test/graphql");
+    }
+
     #[test]
     fn endpoint_accepts_root_and_graphql() {
         let mut c = Config {

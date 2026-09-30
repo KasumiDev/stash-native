@@ -197,6 +197,7 @@ unsafe fn run_inner() -> c_int {
     if let Ok(api_key) = std::env::var("STASH_API_KEY") {
         config.api_key = api_key;
     }
+    config.apply_server_fallback(option_env!("STASH_DEFAULT_URL").unwrap_or_default());
     let mut rig = StashRig {
         mount: Mount,
         worker: Worker::new(config.clone(), path),
