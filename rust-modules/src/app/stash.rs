@@ -248,6 +248,12 @@ fn fixture_texture(key: &str, phase: u32, old: u32) -> u32 {
     }
     crate::gfx::upload_rgba(old, 96, 144, pixels.as_ptr())
 }
+fn scene_boot_route(route: &str) -> Option<StashArg> {
+    route
+        .strip_prefix("scene=")
+        .filter(|id| !id.is_empty())
+        .map(|id| StashArg::Scene(id.to_owned()))
+}
 /// Uses no Plex boot/session side effects. Runtime settings are loaded before frame ownership.
 pub(crate) fn run() -> c_int {
     unsafe { run_inner() }
@@ -292,6 +298,7 @@ unsafe fn run_inner() -> c_int {
         .ok()
         .or_else(|| crate::dev::read("screen"))
         .map(|s| match s.trim() {
+            route if scene_boot_route(route).is_some() => scene_boot_route(route).unwrap(),
             "performers" => StashArg::Performers,
             "scenes" => StashArg::Scenes,
             "galleries" => StashArg::Galleries,
@@ -678,6 +685,19 @@ unsafe fn run_inner() -> c_int {
 mod tests {
     use super::*;
     use crate::ui::Rect;
+    #[test]
+    fn explicit_scene_boot_preserves_the_requested_identity() {
+        assert_eq!(
+            scene_boot_route("scene=19"),
+            Some(StashArg::Scene("19".into()))
+        );
+        assert_eq!(
+            scene_boot_route("scene=4315"),
+            Some(StashArg::Scene("4315".into()))
+        );
+        assert_eq!(scene_boot_route("scene="), None);
+        assert_eq!(scene_boot_route("home"), None);
+    }
     #[test]
     fn stash_boot_initializes_native_media_before_playback() {
         // Host seams cannot decode hardware video. Pin the real startup composition:
