@@ -130,7 +130,8 @@ fi
 ok "$(wc -l < "$AUDIT_TMP/dt-needed.actual" | tr -d ' ') entries, unchanged"
 
 echo "== build-host identity =="
-# docs/distribution.md §4: a public build must not carry the developer's LAN or home directory.
+# docs/distribution.md §4: a public build must not carry accidental developer LAN or home paths.
+# The user explicitly authorized 192.168.0.10 as StashNative's fallback server.
 # Those are TWO independent properties and this section used to conflate them, which is how the
 # one that gates everything went unverified for so long:
 #
@@ -165,12 +166,20 @@ fi
 # Dots also belong to the token: do not extract four components out of a longer
 # dotted number sequence. URL separators and ports still delimit real IPv4 literals.
 PRIVATE_IPV4_RE='(^|[^[:alnum:]_.])(10\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[01])|192\.168)\.[0-9]{1,3}\.[0-9]{1,3}($|[^[:alnum:]_.])'
-if grep -qE "$PRIVATE_IPV4_RE" "$AUDIT_TMP/strings"; then
-  grep -oE "$PRIVATE_IPV4_RE" "$AUDIT_TMP/strings" | sort -u | sed -n '1,10p'
+# Mask only the complete authorized address. Lookarounds preserve delimiters and allow repeated
+# occurrences while retaining neighboring addresses (including 192.168.0.100) for the guard.
+python3 - "$AUDIT_TMP/strings" "$AUDIT_TMP/private-ip-scan" <<'PY' || fail "private-IP allowlist scan failed"
+import pathlib, re, sys
+data = pathlib.Path(sys.argv[1]).read_bytes()
+data = re.sub(rb'(?<![A-Za-z0-9_.])192\.168\.0\.10(?![A-Za-z0-9_.])', b'STASH_DEFAULT_SERVER', data)
+pathlib.Path(sys.argv[2]).write_bytes(data)
+PY
+if grep -qE "$PRIVATE_IPV4_RE" "$AUDIT_TMP/private-ip-scan"; then
+  grep -oE "$PRIVATE_IPV4_RE" "$AUDIT_TMP/private-ip-scan" | sort -u | sed -n '1,10p'
   fail "private IP address baked into the binary — was this built with src/config.local.h present?"
 fi
 grep -q YOUR_PMS_HOST "$AUDIT_TMP/strings" \
   || fail "YOUR_PMS_HOST placeholder absent — a real PMS_HOST was compiled in"
-ok "no private IPs, placeholder present"
+ok "no unapproved private IPs (192.168.0.10 allowed), placeholder present"
 
 echo "all ELF assertions passed"

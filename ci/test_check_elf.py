@@ -131,6 +131,20 @@ class ElfGateTests(unittest.TestCase):
                 self.assertIn("private IP address", result.stdout)
                 self.assertIn(address, result.stdout, "the gate must identify the full four-octet address")
 
+    def test_authorized_stash_server_is_allowed_as_a_complete_address(self):
+        spec = defaults()
+        spec["strings"]["output"] += "http://192.168.0.10:9999/graphql\n192.168.0.10 192.168.0.10\n"
+        self.assert_pass(spec)
+
+    def test_authorized_server_does_not_hide_other_private_addresses(self):
+        for address in ("192.168.0.100", "192.168.0.11", "10.23.45.67"):
+            with self.subTest(address=address):
+                spec = defaults()
+                spec["strings"]["output"] += "http://192.168.0.10:9999/graphql http://" + address + "/\n"
+                result = self.run_gate(spec)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(address, result.stdout)
+
     def test_neighbouring_public_ipv4_ranges_are_allowed(self):
         spec = defaults()
         spec["strings"]["output"] += "9.11.12.13\n11.11.12.13\n172.15.255.255\n172.32.0.1\n192.167.0.1\n192.169.0.1\n"
