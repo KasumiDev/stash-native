@@ -257,6 +257,7 @@ unsafe fn run_inner() -> c_int {
         Ok(p) => p,
         Err(e) => return e,
     };
+    #[cfg(not(test))]
     crate::i18n::initialize(
         crate::i18n::Preference::System,
         cfg!(feature = "hostsim") && std::env::var("STASH_FIXTURES").as_deref() == Ok("1"),
@@ -321,6 +322,11 @@ unsafe fn run_inner() -> c_int {
         ),
     );
     let mt = crate::task::MainThread::assume();
+    // Preserve the original native startup after platform/libcurl initialization.
+    // FFmpeg refuses demux until its ABI check passes; webOS 4.x needs ACB to
+    // attach decoded frames to the app's hardware video plane.
+    crate::player::acb_init(&mt);
+    crate::ff::boot();
     let mut playback = crate::stash_media::playback::Playback::new(mt);
     let mut remote = crate::remote::Remote::open();
     let mut previous = clock::now();
@@ -672,6 +678,22 @@ unsafe fn run_inner() -> c_int {
 mod tests {
     use super::*;
     use crate::ui::Rect;
+    #[test]
+    fn stash_boot_initializes_native_media_before_playback() {
+        // Host seams cannot decode hardware video. Pin the real startup composition:
+        // FFmpeg's ABI gate starts closed and ACB owns the webOS 4.x video plane.
+        let source = include_str!("stash.rs");
+        let startup = source.split("unsafe fn run_inner()").nth(1).unwrap();
+        let startup = startup.split("let mut playback =").next().unwrap();
+        let token = startup.find("let mt =").unwrap();
+        let acb = startup
+            .find("crate::player::acb_init(&mt)")
+            .expect("ACB must initialize before Playback");
+        let ffmpeg = startup
+            .find("crate::ff::boot()")
+            .expect("FFmpeg ABI gate must open before Playback");
+        assert!(token < acb && acb < ffmpeg);
+    }
     #[test]
     fn root_back_returns_home_and_preserves_connection_setup() {
         assert_eq!(
