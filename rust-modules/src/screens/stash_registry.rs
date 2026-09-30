@@ -6,7 +6,15 @@ use crate::ui::machine::*;
 use crate::ui::screen::{Mounter, ReturnState, Screen, ScreenArg};
 impl ScreenArg for StashArg {
     fn chrome(&self) -> Chrome {
-        Chrome::None
+        match self {
+            Self::Home
+            | Self::Performers
+            | Self::Scenes
+            | Self::Galleries
+            | Self::Tags
+            | Self::Search => Chrome::TabBar,
+            _ => Chrome::None,
+        }
     }
     fn id(&self) -> ScreenId {
         ScreenId(match self {
@@ -41,6 +49,38 @@ impl LogicalState for StashArg {
     }
 }
 pub struct StashHost;
+pub(crate) const STASH_ACTIVITY: StoreOrd = StoreOrd(0x5354_4153);
+/// Shared strip identities are navigation actions, never provider content identifiers.
+pub(crate) fn strip_destination(key: u32) -> Option<StashArg> {
+    let index = key.checked_sub(crate::ui::dispatch::STRIP_BASE)?;
+    match index {
+        0 => Some(StashArg::Home),
+        1 => Some(StashArg::Performers),
+        2 => Some(StashArg::Scenes),
+        3 => Some(StashArg::Galleries),
+        4 => Some(StashArg::Tags),
+        5 => Some(StashArg::Search),
+        6 => Some(StashArg::Settings),
+        _ => None,
+    }
+}
+/// Read-only native playback projection; the transport remains application-owned.
+#[derive(Clone, Debug, Default)]
+pub struct PlaybackView {
+    pub scene: Option<Scene>,
+    pub position: f64,
+    pub duration: f64,
+    pub playing: bool,
+    pub loading: bool,
+    pub completed: bool,
+    pub o_count: i64,
+    pub o_pending: bool,
+    pub error: String,
+    pub audio: Vec<String>,
+    pub subtitles: Vec<String>,
+    pub selected_audio: i32,
+    pub selected_subtitle: i32,
+}
 #[derive(Default)]
 pub struct Init;
 impl LogicalState for Init {
@@ -60,7 +100,7 @@ pub enum StashFx {
 pub struct Views<'a> {
     pub textures: &'a std::collections::HashMap<String, (u32, f32, f32)>,
     pub config: &'a Config,
-    pub player_status: &'a str,
+    pub playback: &'a PlaybackView,
 }
 impl Host for StashHost {
     type Arg = StashArg;
@@ -85,6 +125,21 @@ impl Mounter<StashHost> for Mount {
             InputOwner::Entry(e) => e,
             _ => EntryId(0),
         };
-        Box::new(crate::screens::stash::StashScreen::new(arg.clone(), entry))
+        match arg {
+            StashArg::Home => Box::new(crate::screens::stash::home::HomeScreen::new(entry)),
+            StashArg::Scene(id) => Box::new(crate::screens::stash::SceneDetailScreen::new(
+                id.clone(),
+                entry,
+            )),
+            StashArg::Player(id) => Box::new(crate::screens::stash::player::PlayerScreen::new(
+                id.clone(),
+                entry,
+            )),
+            StashArg::Settings => Box::new(crate::screens::stash::SettingsScreen::new(entry)),
+            StashArg::Viewer { gallery, index } => Box::new(
+                crate::screens::stash::ViewerScreen::new(entry, gallery.clone(), *index),
+            ),
+            _ => Box::new(crate::screens::stash::StashScreen::new(arg.clone(), entry)),
+        }
     }
 }

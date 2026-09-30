@@ -2028,5 +2028,103 @@
   "browse.collection.order.custom": {
     "value": "Custom order",
     "description": "Annotation after the collection page's Items heading: members are in the order the collection's owner set"
+  },
+  "stash.player.finished": {
+    "value": "Playback finished",
+    "description": "Stash scene playback and detail interface"
+  },
+  "stash.player.o_question": {
+    "value": "Increase the O count for this scene?",
+    "description": "Stash scene playback and detail interface"
+  },
+  "stash.player.replay": {
+    "value": "Replay",
+    "description": "Stash scene playback and detail interface"
+  },
+  "stash.player.o_plus": {
+    "value": "O +1",
+    "description": "Stash scene playback and detail interface"
+  },
+  "stash.player.play_pause": {
+    "value": "Play / Pause",
+    "description": "Stash scene playback and detail interface"
+  },
+  "stash.player.audio": {
+    "value": "Audio",
+    "description": "Stash scene playback and detail interface"
+  },
+  "stash.player.subtitles": {
+    "value": "Subtitles",
+    "description": "Stash scene playback and detail interface"
+  },
+  "stash.player.subtitles_off": {
+    "value": "Off",
+    "description": "Stash scene playback and detail interface"
+  },
+  "stash.player.loading": {
+    "value": "Loading",
+    "description": "Stash scene playback and detail interface"
+  },
+  "stash.detail.o_count": {
+    "value": "O count",
+    "description": "Stash scene playback and detail interface"
+  },
+  "stash.detail.studio": {
+    "value": "Studio",
+    "description": "Stash scene playback and detail interface"
+  },
+  "stash.player.count": {
+    "value": "O-count: {count}",
+    "args": {
+      "count": "i64"
+    },
+    "description": "Scene O counter shown after playback and counter synchronization"
+  },
+  "browse.gallery.previous": {
+    "value": "Previous",
+    "description": "Stash navigation, server settings, and image viewer"
+  },
+  "browse.gallery.next": {
+    "value": "Next",
+    "description": "Stash navigation, server settings, and image viewer"
+  },
+  "browse.gallery.slideshow_start": {
+    "value": "Start slideshow",
+    "description": "Stash navigation, server settings, and image viewer"
+  },
+  "browse.gallery.slideshow_pause": {
+    "value": "Pause slideshow",
+    "description": "Stash navigation, server settings, and image viewer"
+  },
+  "browse.gallery.seconds": {
+    "value": "{count} seconds",
+    "description": "Stash navigation, server settings, and image viewer",
+    "args": {
+      "count": "i64"
+    }
+  },
+  "browse.gallery.empty": {
+    "value": "No images",
+    "description": "Stash navigation, server settings, and image viewer"
+  },
+  "browse.stash.home": {
+    "value": "Home",
+    "description": "Stash navigation, server settings, and image viewer"
+  },
+  "browse.stash.performers": {
+    "value": "Performers",
+    "description": "Stash navigation, server settings, and image viewer"
+  },
+  "browse.stash.scenes": {
+    "value": "Scenes",
+    "description": "Stash navigation, server settings, and image viewer"
+  },
+  "browse.stash.galleries": {
+    "value": "Galleries",
+    "description": "Stash navigation, server settings, and image viewer"
+  },
+  "browse.stash.tags": {
+    "value": "Tags",
+    "description": "Stash navigation, server settings, and image viewer"
   }
 }

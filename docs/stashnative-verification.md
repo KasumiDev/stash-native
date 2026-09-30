@@ -10,13 +10,14 @@ Firmware source review confirmed the preview wrapper uses matching bundled FFmpe
 
 ## Tests you perform after installing
 
-1. Open every section and detail route. Check arrows, focus, Back, search, sort, loading/error/retry, and pagination. Check Home favorites appear before nonfavorites.
+1. Open every section and detail route. Check arrows, focus, Back, search, sort, loading/error/retry, and pagination. Check Home favorites appear before nonfavorites. The shared top menu should retain the original profile-chip and centered-tab layout. Home's newest scenes belong in the full-screen hero; scene details use the shared movie-detail hero layout.
 2. Leave a scene focused for at least 700 ms. Confirm one muted preview loops and stops immediately on focus loss, navigation, and full playback. A missing or failed preview should retain the still.
 3. View a shelf of animated performer portraits. Confirm visible portraits animate and off-screen work stops. Assets exceeding the shared decoded-media budget retain stills.
 4. Open a gallery, navigate previous/next, and run slideshows at three, five, and ten seconds.
-5. Play the dedicated test scene. Exercise pause/resume, seek, audio and subtitles where available. Check position and watched duration after at least 30 seconds, then stop and resume. At natural completion, resume position should clear.
+5. Play the dedicated test scene. Exercise the shared transport HUD, pause/resume, seek, audio and subtitles where available. Check position and watched duration after at least 30 seconds, then stop and resume. At natural completion, resume position should clear and the end screen should offer Replay and an explicit O +1 action. Episode and intro controls are absent.
 6. Press O +1 once and hold the key. Confirm one intentional activation yields one increment and displayed counts refresh.
 7. Repeat at least 100 preview focus changes and observe resource usage. This has not been performed on the TV by the assistant.
+8. With the Magic Remote cursor still visible, click a scene and each player control. A release over the selected card must activate once; pressing and moving away before release must cancel. Check wheel navigation and directional focus after hiding the pointer. The Stash SDL adapter now uses the shared pointer, drag, release, key, and wheel bridge.
 
 Use dedicated test content for history and counter writes. Do not automatically retry a timed-out additive mutation: the server may already have applied it.
 

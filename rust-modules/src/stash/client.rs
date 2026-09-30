@@ -98,7 +98,7 @@ pub struct Client {
 const PERFORMER: &str = "id name image_path favorite o_counter";
 const TAG: &str = "id name image_path favorite";
 const IMAGE: &str = "id title paths { image thumbnail }";
-const SCENE: &str = "id title date o_counter resume_time play_duration play_count paths { screenshot preview stream webp } files { duration width height video_codec audio_codec format } sceneStreams { url mime_type label } performers { id name image_path favorite o_counter } tags { id name image_path favorite }";
+const SCENE: &str = "id title date details studio { id name } o_counter resume_time play_duration play_count paths { screenshot preview stream webp } files { duration width height video_codec audio_codec format } sceneStreams { url mime_type label } performers { id name image_path favorite o_counter } tags { id name image_path favorite }";
 const GALLERY: &str = "id title image_count cover { id title paths { image thumbnail } } performers { id name image_path favorite o_counter } tags { id name image_path favorite }";
 
 impl Client {

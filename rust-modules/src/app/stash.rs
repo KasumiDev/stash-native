@@ -7,10 +7,39 @@ use crate::ui::frame::Budget;
 use crate::ui::machine::Key;
 use crate::ui::machine::*;
 use crate::ui::present::{Present, Provenance};
+use crate::ui::screen::ScreenArg;
 
 use crate::stash::Config;
 use crate::stash_media::MediaManager;
 use std::collections::HashMap;
+#[derive(Default)]
+struct PointerIngress {
+    button_down: bool,
+    last_wheel: u32,
+}
+impl PointerIngress {
+    fn motion(&mut self, kind: u32, x: f32, y: f32, tick: Tick) -> Vec<InputEvent<u32>> {
+        vec![match kind {
+            SDL_MOUSEBUTTONDOWN => {
+                self.button_down = true;
+                super::bridge::click_input(x, y, tick)
+            }
+            SDL_MOUSEBUTTONUP => {
+                self.button_down = false;
+                super::bridge::release_input(tick)
+            }
+            _ if self.button_down => super::bridge::drag_input(x, y, tick),
+            _ => super::bridge::pointer_input(x, y, tick),
+        }]
+    }
+    fn wheel(&mut self, dy: i32, tick: Tick) -> Vec<InputEvent<u32>> {
+        if dy == 0 || tick.ms.wrapping_sub(self.last_wheel) <= 250 {
+            return Vec::new();
+        }
+        self.last_wheel = tick.ms;
+        super::bridge::wheel_input(dy, tick)
+    }
+}
 fn register_work(
     dispatcher: &mut Dispatcher<StashHost>,
     work: &mut Vec<(Addr, crate::stores::stash::Work)>,
@@ -30,6 +59,33 @@ fn root_back(arg: Option<&StashArg>, configured: bool) -> Option<StashArg> {
         _ => Some(StashArg::Home),
     }
 }
+/// Finite simulator scenes render the native HUD without starting media or writing history.
+#[cfg(feature = "hostsim")]
+fn fixture_playback(route: &str) -> Option<PlaybackView> {
+    if !matches!(route, "player" | "ended" | "audio" | "subtitles") {
+        return None;
+    }
+    Some(PlaybackView {
+        scene: Some(crate::stash::Scene {
+            id: "1".into(),
+            title: Some("Scene 1".into()),
+            ..Default::default()
+        }),
+        position: 120.,
+        duration: 1560.,
+        playing: true,
+        completed: route == "ended",
+        o_count: 7,
+        audio: vec![
+            "English · AAC · Stereo".into(),
+            "French · AAC · Stereo".into(),
+        ],
+        subtitles: vec!["English · SRT".into(), "French · SRT".into()],
+        selected_audio: 0,
+        selected_subtitle: -1,
+        ..Default::default()
+    })
+}
 struct StashRig {
     mount: Mount,
     worker: Worker,
@@ -39,7 +95,8 @@ struct StashRig {
     media: MediaManager,
     pending: Vec<StashFx>,
     work: Vec<(Addr, crate::stores::stash::Work)>,
-    status: String,
+    playback: PlaybackView,
+    chrome: super::stash_chrome::StashChrome,
     now: u32,
 }
 impl Rig<StashHost> for StashRig {
@@ -49,7 +106,7 @@ impl Rig<StashHost> for StashRig {
             views: Views {
                 textures: &self.textures,
                 config: &self.config,
-                player_status: &self.status,
+                playback: &self.playback,
             },
             measure: &self.measure,
         }
@@ -142,6 +199,20 @@ impl Rig<StashHost> for StashRig {
         }
     }
     fn prepare(&mut self, _: &mut Budget, _: &mut Present) {}
+    fn draw_chrome(
+        &mut self,
+        arg: &StashArg,
+        _: &CxParts<u32>,
+        nav: crate::ui::screen::NavPresentation,
+        glass: Option<&mut crate::ui::frame::glass::GlassPlan>,
+    ) {
+        if arg.chrome() == Chrome::TabBar {
+            if let Some(glass) = glass {
+                self.chrome
+                    .draw(crate::ui::Painter::root().alpha(nav.chrome_alpha), glass);
+            }
+        }
+    }
     fn log(&mut self, line: &str) {
         crate::log(line)
     }
@@ -186,6 +257,10 @@ unsafe fn run_inner() -> c_int {
         Ok(p) => p,
         Err(e) => return e,
     };
+    crate::i18n::initialize(
+        crate::i18n::Preference::System,
+        cfg!(feature = "hostsim") && std::env::var("STASH_FIXTURES").as_deref() == Ok("1"),
+    );
     let path = crate::paths::persistent_state_root().join("stash.json");
     let env = Config::from_env();
     let mut config = Config::load(&path)
@@ -207,7 +282,8 @@ unsafe fn run_inner() -> c_int {
         media: MediaManager::new(),
         pending: Vec::new(),
         work: Vec::new(),
-        status: String::new(),
+        playback: PlaybackView::default(),
+        chrome: super::stash_chrome::StashChrome::new(&crate::text::TtfMeasure),
         now: 0,
     };
     let mut dispatcher = Dispatcher::<StashHost>::new();
@@ -229,6 +305,7 @@ unsafe fn run_inner() -> c_int {
                 gallery: "1".into(),
                 index: 0,
             },
+            "player" | "ended" | "audio" | "subtitles" => StashArg::Player("1".into()),
             _ => StashArg::Home,
         })
         .unwrap_or(StashArg::Home);
@@ -250,6 +327,19 @@ unsafe fn run_inner() -> c_int {
     let mut fixture_phase = 0;
     let mut running = true;
     let mut event = [0u8; 128];
+    let mut pointer = PointerIngress::default();
+    let mut glass = crate::ui::frame::glass::GlassPlan::new();
+    let mut current_scene: Option<crate::stash::Scene> = None;
+    let mut playback_error: Option<String> = None;
+    let mut activity_generation = 0u32;
+    #[cfg(feature = "hostsim")]
+    let fixture_route = if std::env::var("STASH_FIXTURES").as_deref() == Ok("1") {
+        std::env::var("STASH_SCREEN").unwrap_or_default()
+    } else {
+        String::new()
+    };
+    #[cfg(feature = "hostsim")]
+    let mut fixture_panel_phase = 0u8;
     while running {
         #[cfg(all(feature = "hostsim", target_os = "linux"))]
         let pacing = platform
@@ -270,6 +360,7 @@ unsafe fn run_inner() -> c_int {
             ms: now,
             dt_us: now.wrapping_sub(previous).min(50) * 1000,
         };
+        crate::ui::idle::frame_begin(tick.dt());
         previous = now;
         rig.now = now;
         if cfg!(feature = "hostsim")
@@ -320,39 +411,40 @@ unsafe fn run_inner() -> c_int {
                             _ => Key::Other,
                         },
                     };
-                    inputs.push(InputEvent {
-                        at: tick,
-                        source: Source::Sdl,
-                        kind: if sym == 8 && edge != Edge::Up {
-                            InputKind::Text(TextEdit::Backspace)
-                        } else {
-                            InputKind::Key {
-                                key,
-                                sym,
-                                wcode,
-                                edge,
-                                at_edge: false,
-                            }
-                        },
-                    });
+                    if sym == 8 && edge != Edge::Up {
+                        inputs.push(InputEvent {
+                            at: tick,
+                            source: Source::Sdl,
+                            kind: InputKind::Text(TextEdit::Backspace),
+                        });
+                    } else {
+                        let _ = key;
+                        inputs.push(super::bridge::key_input(
+                            sym,
+                            wcode,
+                            if kind == SDL_KEYUP { 0 } else { state },
+                            tick,
+                            Source::Sdl,
+                        ));
+                    }
                 }
                 SDL_TEXTINPUT => {
                     let text = crate::textinput::decode(&event);
                     inputs.extend(events::text_inputs(&text, false, tick, Source::Sdl));
                 }
-                SDL_MOUSEMOTION | SDL_MOUSEBUTTONDOWN => {
+                SDL_MOUSEMOTION | SDL_MOUSEBUTTONDOWN | SDL_MOUSEBUTTONUP => {
                     let x = events::rd_u32(&event, 20) as i32 as f32;
                     let y = events::rd_u32(&event, 24) as i32 as f32;
                     let (x, y) = crate::surface::to_logical(x, y);
-                    inputs.push(InputEvent {
-                        at: tick,
-                        source: Source::Sdl,
-                        kind: if kind == SDL_MOUSEMOTION {
-                            InputKind::Pointer { x, y, hit: None }
-                        } else {
-                            InputKind::Click { x, y, hit: None }
-                        },
-                    });
+                    inputs.extend(pointer.motion(kind, x, y, tick));
+                }
+                SDL_MOUSEWHEEL => {
+                    let dy = if cfg!(feature = "hostsim") {
+                        f32::from_bits(events::rd_u32(&event, 32)).round() as i32
+                    } else {
+                        events::rd_u32(&event, 20) as i32
+                    };
+                    inputs.extend(pointer.wheel(dy, tick));
                 }
                 _ => {}
             }
@@ -371,7 +463,64 @@ unsafe fn run_inner() -> c_int {
                 .present
                 .note(crate::ui::present::PresentEvent::Damage(Provenance::Input));
         }
+        let previous_o_count = playback.o_count;
         playback.tick(now as u64);
+        if playback.o_count != previous_o_count {
+            activity_generation = activity_generation.wrapping_add(1);
+            dispatcher.store_changed(STASH_ACTIVITY, activity_generation);
+        }
+        if let Some(scene) = current_scene.as_mut() {
+            if playback.scene_id.as_deref() == Some(scene.id.as_str()) {
+                scene.resume_time = if playback.completed() {
+                    0.
+                } else {
+                    playback.position()
+                };
+                scene.o_counter = playback.o_count.unwrap_or(scene.o_counter);
+            }
+        }
+        rig.playback = PlaybackView {
+            scene: current_scene.clone(),
+            position: playback.position(),
+            duration: playback.duration(),
+            playing: playback.playing(),
+            loading: playback.loading(),
+            completed: playback.completed(),
+            o_count: playback.o_count.unwrap_or_default(),
+            o_pending: playback.o_pending(),
+            error: playback
+                .error()
+                .or_else(|| playback_error.clone())
+                .or_else(|| playback.sync_error.clone())
+                .unwrap_or_default(),
+            audio: playback.audio_tracks(),
+            subtitles: playback.subtitle_tracks(),
+            selected_audio: playback.selected_audio(),
+            selected_subtitle: playback.selected_subtitle(),
+        };
+        #[cfg(feature = "hostsim")]
+        if let Some(view) = fixture_playback(&fixture_route) {
+            rig.playback = view;
+            if matches!(fixture_route.as_str(), "audio" | "subtitles")
+                && matches!(dispatcher.top_arg(), Some(StashArg::Player(_)))
+                && fixture_panel_phase < 2
+            {
+                let disc = crate::ui::player_hud::disc_hit_rect(if fixture_route == "audio" {
+                    1
+                } else {
+                    0
+                });
+                let kind = if fixture_panel_phase == 0 {
+                    SDL_MOUSEBUTTONDOWN
+                } else {
+                    SDL_MOUSEBUTTONUP
+                };
+                inputs.extend(pointer.motion(kind, disc.cx(), disc.cy(), tick));
+                fixture_panel_phase += 1;
+            }
+        }
+        rig.chrome.capture(&mut dispatcher, tick.dt());
+        glass.step_tab_band(tick.dt());
         let results = rig.worker.poll();
         for (_, msg) in &results {
             if let StashMsg::Connected(Ok(config)) = msg {
@@ -385,9 +534,28 @@ unsafe fn run_inner() -> c_int {
             .note(crate::ui::present::PresentEvent::VideoPlane(
                 playback.scene_id.is_some(),
             ));
-        crate::ui::idle::frame_begin(tick.dt());
+        if crate::ui::idle::present_moving() {
+            dispatcher
+                .present
+                .note(crate::ui::present::PresentEvent::Motion);
+        }
+        #[cfg(feature = "hostsim")]
+        if std::env::var("STASH_FIXTURES").as_deref() == Ok("1") {
+            // Finite capture fixtures need a deterministic presented-frame count, including
+            // static catalog and paused/end-screen routes with no real video plane.
+            dispatcher
+                .present
+                .note(crate::ui::present::PresentEvent::Damage(Provenance::Input));
+        }
         crate::text::begin_frame();
         let report = dispatcher.frame_with(&mut rig, tick, inputs, results, &mut NoTap, false);
+        if crate::ui::idle::present_moving() {
+            // Shared card/chrome springs use the legacy motion reporter. Carry their last
+            // step into the next dispatcher frame just as the original outer loop does.
+            dispatcher
+                .present
+                .note(crate::ui::present::PresentEvent::Motion);
+        }
         if report.back_at_root {
             match root_back(dispatcher.top_arg(), !rig.config.server_url.is_empty()) {
                 Some(next) => {
@@ -404,17 +572,43 @@ unsafe fn run_inner() -> c_int {
         // Playback effects are consumed outside the dispatcher borrow and frame scope.
         for effect in std::mem::take(&mut rig.pending) {
             match effect {
-                StashFx::Play(scene, resume) => {
+                StashFx::Play(mut scene, resume) => {
+                    if dispatcher.top_arg() != Some(&StashArg::Player(scene.id.clone())) {
+                        continue;
+                    }
+                    if let Some(previous) = current_scene.as_ref().filter(|s| s.id == scene.id) {
+                        scene.resume_time = previous.resume_time;
+                        scene.o_counter = previous.o_counter;
+                    }
+                    current_scene = Some(scene.clone());
                     rig.media.stop_preview();
                     match crate::stash::Client::new(rig.config.clone())
                         .map_err(|e| e.to_string())
                         .and_then(|client| playback.start(client, &scene, resume))
                     {
-                        Ok(()) => rig.status = scene.display_title().to_owned(),
-                        Err(error) => rig.status = error,
+                        Ok(()) => {
+                            playback_error = None;
+                        }
+                        Err(error) => {
+                            playback_error = Some(error.clone());
+                        }
                     }
                 }
                 StashFx::Player(action) => match action {
+                    Action::Replay => {
+                        if let Some(scene) = &current_scene {
+                            if let Ok(client) = crate::stash::Client::new(rig.config.clone()) {
+                                if let Err(e) = playback.start(client, scene, false) {
+                                    playback_error = Some(e.clone());
+                                } else {
+                                    playback_error = None;
+                                }
+                            }
+                        }
+                    }
+                    Action::SeekTo(position) => playback.seek(position),
+                    Action::AudioTrack(ordinal) => playback.select_audio(ordinal),
+                    Action::SubtitleTrack(ordinal) => playback.subtitle_track(ordinal),
                     Action::Pause => {
                         if playback.playing() {
                             playback.pause()
@@ -422,38 +616,15 @@ unsafe fn run_inner() -> c_int {
                             playback.resume()
                         }
                     }
-                    Action::Seek(delta) => {
-                        playback.seek((playback.position() + delta as f64).max(0.))
-                    }
                     Action::AddO => {
                         playback.o_key(true);
                         playback.o_key(false);
                     }
                     Action::Open(_) => playback.stop(),
-                    Action::Audio => playback.cycle_audio(),
-                    Action::Subtitle => playback.cycle_subtitle(),
                     _ => {}
                 },
                 _ => {}
             }
-        }
-        if playback.scene_id.is_some() {
-            rig.status = format!(
-                "{} · {:.0}:{:02.0} / {:.0}:{:02.0} · O {}",
-                if playback.playing() {
-                    "Playing"
-                } else {
-                    "Paused"
-                },
-                (playback.position() / 60.).floor(),
-                playback.position() % 60.,
-                (playback.duration() / 60.).floor(),
-                playback.duration() % 60.,
-                playback.o_count.unwrap_or_default()
-            );
-        }
-        if let Some(error) = playback.error().or_else(|| playback.sync_error.clone()) {
-            rig.status = error;
         }
         if report.presented {
             crate::surface::probe(platform.win);
@@ -463,7 +634,13 @@ unsafe fn run_inner() -> c_int {
                 let (r, g, b) = crate::ui::theme::CLEAR_RGB;
                 crate::gfx::frame_clear(r, g, b);
             }
-            dispatcher.draw(&mut rig, true);
+            let _walk = glass.walk(crate::ui::frame::backdrop::Z::ALL);
+            dispatcher.draw_with_glass_below(
+                &mut rig,
+                &mut glass,
+                true,
+                crate::ui::frame::backdrop::Z::ALL,
+            );
             #[cfg(feature = "hostsim")]
             {
                 let (vx, vy, vw, vh) = crate::surface::viewport();
@@ -494,6 +671,7 @@ unsafe fn run_inner() -> c_int {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::Rect;
     #[test]
     fn root_back_returns_home_and_preserves_connection_setup() {
         assert_eq!(
@@ -527,6 +705,7 @@ mod tests {
         config: Config,
         textures: HashMap<String, (u32, f32, f32)>,
         work: Vec<(Addr, crate::stores::stash::Work)>,
+        playback: PlaybackView,
     }
     impl Rig<StashHost> for TestRig {
         fn split(&mut self) -> Split<'_, StashHost> {
@@ -535,7 +714,7 @@ mod tests {
                 views: Views {
                     textures: &self.textures,
                     config: &self.config,
-                    player_status: "",
+                    playback: &self.playback,
                 },
                 measure: &Measure,
             }
@@ -585,6 +764,7 @@ mod tests {
             config: Config::default(),
             textures: HashMap::new(),
             work: Vec::new(),
+            playback: PlaybackView::default(),
         };
         let mut dispatcher = Dispatcher::<StashHost>::new();
         dispatcher.request(MachineId::Nav, NavOp::Root(StashArg::Scenes));
@@ -610,7 +790,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             initial_screen.test_focus_identity(initial_focus.elem),
-            Some("control:nav:Home")
+            Some("control:refresh")
         );
         let pending = register_work(&mut dispatcher, &mut rig.work);
         let (addr, work) = pending.into_iter().next().unwrap();
@@ -669,7 +849,153 @@ mod tests {
         assert_eq!(dispatcher.focus(), Some(initial_focus));
         assert_eq!(
             stash.test_focus_identity(initial_focus.elem),
-            Some("control:nav:Home")
+            Some("control:refresh")
         );
+        // Use the actual catalog's geometry and the same double-buffered map as a presented
+        // frame. No injected semantic activation bypasses SDL's button-up ingress.
+        let key = stash.test_content_key("scene:fixture0").unwrap();
+        let rect = {
+            let split = rig.split();
+            let cx = Cx {
+                views: split.views,
+                measure: split.measure,
+                tick: Tick::default(),
+                press: PressRead::default(),
+                focus: FocusRead::default(),
+                owner: InputOwner::Entry(initial_focus.entry),
+            };
+            dispatcher
+                .top_screen()
+                .unwrap()
+                .place(&key, &cx, crate::ui::screen::At::Drawn)
+                .unwrap()
+                .rect
+        };
+        dispatcher.input.hit.fill(vec![crate::ui::screen::Stop {
+            key: FocusKey {
+                entry: initial_focus.entry,
+                elem: key,
+            },
+            rect,
+            rest_rect: rect,
+            clip: Rect::FULL,
+            hover: crate::ui::screen::Hover::Focus,
+            activate: crate::ui::screen::Activate::Press,
+        }]);
+        dispatcher.input.hit.swap();
+        let mut ingress = PointerIngress::default();
+        let tick = |ms| Tick { ms, dt_us: 16000 };
+        for (ms, kind, x, y) in [
+            (32, SDL_MOUSEMOTION, rect.cx(), rect.cy()),
+            (48, SDL_MOUSEBUTTONDOWN, rect.cx(), rect.cy()),
+            (64, SDL_MOUSEMOTION, 0., 0.),
+            (80, SDL_MOUSEBUTTONUP, 0., 0.),
+        ] {
+            let at = tick(ms);
+            dispatcher.frame_with(
+                &mut rig,
+                at,
+                ingress.motion(kind, x, y, at),
+                Vec::new(),
+                &mut NoTap,
+                false,
+            );
+        }
+        for ms in (96..=400).step_by(16) {
+            dispatcher.frame_with(
+                &mut rig,
+                tick(ms),
+                Vec::new(),
+                Vec::new(),
+                &mut NoTap,
+                false,
+            );
+        }
+        assert_eq!(
+            dispatcher.top_arg(),
+            Some(&StashArg::Scenes),
+            "moving away cancels a pointer press"
+        );
+        for (ms, kind) in [
+            (416, SDL_MOUSEMOTION),
+            (432, SDL_MOUSEBUTTONDOWN),
+            (448, SDL_MOUSEBUTTONUP),
+        ] {
+            let at = tick(ms);
+            dispatcher.frame_with(
+                &mut rig,
+                at,
+                ingress.motion(kind, rect.cx(), rect.cy(), at),
+                Vec::new(),
+                &mut NoTap,
+                false,
+            );
+        }
+        for ms in (464..=1000).step_by(16) {
+            dispatcher.frame_with(
+                &mut rig,
+                tick(ms),
+                Vec::new(),
+                Vec::new(),
+                &mut NoTap,
+                false,
+            );
+        }
+        assert_eq!(
+            dispatcher.top_arg(),
+            Some(&StashArg::Scene("fixture".into())),
+            "release opens the scene before the dropped-up timeout"
+        );
+        assert!(
+            dispatcher.input.arm.is_none(),
+            "one pointer click commits once"
+        );
+    }
+    #[test]
+    fn pointer_drag_release_and_wheel_follow_original_bridge() {
+        let mut ingress = PointerIngress::default();
+        let tick = Tick { ms: 1000, dt_us: 0 };
+        assert!(matches!(
+            ingress.motion(SDL_MOUSEBUTTONDOWN, 1., 2., tick)[0].kind,
+            InputKind::Click { .. }
+        ));
+        assert!(matches!(
+            ingress.motion(SDL_MOUSEMOTION, 3., 4., tick)[0].kind,
+            InputKind::Drag { .. }
+        ));
+        assert!(matches!(
+            ingress.motion(SDL_MOUSEBUTTONUP, 3., 4., tick)[0].kind,
+            InputKind::Key {
+                key: Key::Ok,
+                edge: Edge::Up,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ingress.motion(SDL_MOUSEMOTION, 3., 4., tick)[0].kind,
+            InputKind::Pointer { .. }
+        ));
+        let wheel = ingress.wheel(-1, tick);
+        assert!(matches!(
+            wheel[0].kind,
+            InputKind::Key {
+                key: Key::Down,
+                edge: Edge::Down,
+                ..
+            }
+        ));
+        assert!(matches!(
+            wheel[1].kind,
+            InputKind::Key {
+                key: Key::Down,
+                edge: Edge::Up,
+                ..
+            }
+        ));
+        assert!(ingress.wheel(1, Tick { ms: 1100, ..tick }).is_empty());
+        assert!(matches!(
+            ingress.wheel(1, Tick { ms: 1300, ..tick })[0].kind,
+            InputKind::Key { key: Key::Up, .. }
+        ));
     }
 }

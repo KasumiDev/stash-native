@@ -1049,5 +1049,29 @@
   "settings.consent.placeholder.webos_codename_short": {
     "value": "webOS codename",
     "description": "Placeholder shown inside angle brackets in the data preview, standing for the TV software's release codename."
+  },
+  "settings.stash.server_url": {
+    "value": "Server URL",
+    "description": "Stash navigation, server settings, and image viewer"
+  },
+  "settings.stash.api_key": {
+    "value": "API key",
+    "description": "Stash navigation, server settings, and image viewer"
+  },
+  "settings.stash.optional": {
+    "value": "Optional",
+    "description": "Stash navigation, server settings, and image viewer"
+  },
+  "settings.stash.testing": {
+    "value": "Testing connection…",
+    "description": "Stash navigation, server settings, and image viewer"
+  },
+  "settings.stash.test_save": {
+    "value": "Test and save",
+    "description": "Stash navigation, server settings, and image viewer"
+  },
+  "settings.stash.test_again": {
+    "value": "Test and save again",
+    "description": "Stash navigation, server settings, and image viewer"
   }
 }

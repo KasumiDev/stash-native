@@ -42,18 +42,12 @@ pub enum Action {
     More,
     Sort,
     EditSearch,
-    EditUrl,
-    EditKey,
-    Connect,
-    Previous,
-    Next,
-    Slideshow,
-    Interval,
     Pause,
-    Seek(i64),
     AddO,
-    Audio,
-    Subtitle,
+    Replay,
+    SeekTo(f64),
+    AudioTrack(i32),
+    SubtitleTrack(i32),
 }
 pub enum StashMsg {
     Loaded {
@@ -88,6 +82,8 @@ pub struct Section {
 #[derive(Clone, Debug, Default)]
 pub struct PageData {
     pub title: String,
+    pub scenes: Vec<Scene>,
+    pub scene: Option<Scene>,
     pub sections: Vec<Section>,
     pub count: usize,
     pub images: Vec<Image>,
@@ -207,6 +203,10 @@ fn fixture(route: &StashArg, query: &Query) -> PageData {
             id: id.to_string(),
             title: Some(format!("Scene {id}")),
             date: Some("2026-09-01".into()),
+            details: Some("A synthetic scene for checking the shared movie detail layout, navigation, and playback controls.".into()),
+            studio: Some(crate::stash::Studio { id: "fixture".into(), name: "Fixture Studio".into() }),
+            files: vec![crate::stash::SceneFile { duration: 1560., width: 1920, height: 1080, video_codec: "h264".into(), audio_codec: "aac".into(), format: "mp4".into() }],
+            resume_time: if id == 1 { 120. } else { 0. },
             o_counter: id,
             paths: crate::stash::ScenePaths {
                 screenshot: Some(format!("fixture://scene/{id}")),
@@ -243,6 +243,7 @@ fn fixture(route: &StashArg, query: &Query) -> PageData {
     };
     match route {
         StashArg::Home => {
+            data.scenes = scenes.clone();
             data.sections.push(section(
                 "Newest scenes",
                 scenes.clone().into_iter().map(scene).collect(),
@@ -305,6 +306,7 @@ fn fixture(route: &StashArg, query: &Query) -> PageData {
                 .unwrap_or(&scenes[0])
                 .clone();
             data.title = scene.display_title().into();
+            data.scene = Some(scene.clone());
             data.sections.push(section(
                 "Playback",
                 vec![
@@ -437,14 +439,10 @@ fn load(c: &Client, r: &StashArg, q: &Query) -> Result<PageData, String> {
                 direction: Direction::Descending,
                 ..Default::default()
             };
+            out.scenes = c.scenes(&newest).map_err(err)?.items;
             out.sections.push(section(
                 "Newest scenes",
-                c.scenes(&newest)
-                    .map_err(err)?
-                    .items
-                    .into_iter()
-                    .map(scene)
-                    .collect(),
+                out.scenes.iter().cloned().map(scene).collect(),
                 false,
             ));
             let favorites = Query {
@@ -526,6 +524,7 @@ fn load(c: &Client, r: &StashArg, q: &Query) -> Result<PageData, String> {
         }
         StashArg::Scene(id) => {
             let s = c.scene(id).map_err(err)?;
+            out.scene = Some(s.clone());
             out.title = s.title.clone().unwrap_or_else(|| "Scene".into());
             out.sections.push(section(
                 "Playback",

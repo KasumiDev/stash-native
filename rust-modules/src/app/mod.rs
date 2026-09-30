@@ -132,6 +132,7 @@ pub(crate) mod chrome;
 pub(crate) mod content;
 pub(crate) mod run;
 pub(crate) mod stash;
+pub(crate) mod stash_chrome;
 use self::boot::*;
 use self::events::*;
 use self::lifecycle::*;

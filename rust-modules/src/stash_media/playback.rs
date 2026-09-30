@@ -15,6 +15,8 @@ pub(crate) struct Playback {
     clock: ActivityClock,
     selected: Option<Selected>,
     resolved_url: Option<String>,
+    completed: bool,
+    o_pending: bool,
     pub sync_error: Option<String>,
     pub o_count: Option<i64>,
     pub scene_id: Option<String>,
@@ -105,6 +107,8 @@ impl Playback {
             clock: ActivityClock::default(),
             selected: None,
             resolved_url: None,
+            completed: false,
+            o_pending: false,
             sync_error: None,
             o_count: None,
             scene_id: None,
@@ -165,6 +169,8 @@ impl Playback {
             ..Default::default()
         };
         self.sync_error = None;
+        self.completed = false;
+        self.o_pending = false;
         Ok(())
     }
     pub fn tick(&mut self, now_ms: u64) {
@@ -176,6 +182,7 @@ impl Playback {
                 continue;
             }
             if is_o {
+                self.o_pending = false;
                 if let Some(history) = &mut self.history {
                     history.o_finished();
                 }
@@ -186,7 +193,7 @@ impl Playback {
                 Err(error) => self.sync_error = Some(error),
             }
         }
-        if self.history.is_none() {
+        if self.history.is_none() || self.completed {
             return;
         }
         player::pump(&mut self.session, &mut self.adapter, now_ms as u32);
@@ -210,19 +217,29 @@ impl Playback {
             self.send(command);
         }
         if player::ended() {
-            self.stop_completed(true);
+            if let Some(command) = completion_flush(self.history.as_mut(), &mut self.completed) {
+                self.send(command);
+                player::engine::stop_bufferfeed(&mut self.session, &mut self.adapter);
+                self.last_tick = None;
+            }
         }
     }
     pub fn pause(&mut self) {
+        if self.completed {
+            return;
+        }
         if player::pause(&mut self.adapter) {
             self.flush(false);
         }
     }
     pub fn resume(&mut self) {
+        if self.completed {
+            return;
+        }
         player::resume(&mut self.adapter);
     }
     pub fn seek(&mut self, seconds: f64) {
-        if !seconds.is_finite() {
+        if self.completed || !seconds.is_finite() {
             return;
         }
         let seconds = seconds.max(0.0);
@@ -261,6 +278,7 @@ impl Playback {
     pub fn o_key(&mut self, down: bool) {
         let command = self.history.as_mut().and_then(|h| h.o_key(down));
         if let Some(command) = command {
+            self.o_pending = true;
             self.send(command);
         }
     }
@@ -289,7 +307,7 @@ impl Playback {
         self.sync_error.clone().map_or(Ok(()), Err)
     }
     fn stop_completed(&mut self, completed: bool) {
-        if self.history.is_some() {
+        if self.history.is_some() && !self.completed {
             self.flush(completed);
         }
         player::engine::stop_bufferfeed(&mut self.session, &mut self.adapter);
@@ -299,6 +317,8 @@ impl Playback {
         self.selected = None;
         self.resolved_url = None;
         self.last_tick = None;
+        self.completed = false;
+        self.o_pending = false;
     }
     fn flush(&mut self, completed: bool) {
         if let Some(history) = &mut self.history {
@@ -321,6 +341,7 @@ impl Playback {
         if failed {
             self.sync_error = Some("Activity queue is full; this update was not replayed".into());
             if is_o {
+                self.o_pending = false;
                 if let Some(history) = &mut self.history {
                     history.o_finished();
                 }
@@ -328,6 +349,9 @@ impl Playback {
         }
     }
     pub fn position(&self) -> f64 {
+        if self.completed {
+            return self.duration();
+        }
         player::playpos_ns().max(0) as f64 / 1e9
     }
     pub fn duration(&self) -> f64 {
@@ -338,59 +362,78 @@ impl Playback {
             .unwrap_or_else(|| player::duration_ns().max(0) as f64 / 1e9)
     }
     pub fn playing(&self) -> bool {
-        player::is_playing(&self.session)
+        !self.completed
+            && player::is_playing(&self.session)
             && !player::TX.paused.load(std::sync::atomic::Ordering::Acquire)
     }
     pub fn error(&self) -> Option<String> {
-        (self.scene_id.is_some() && player::has_error(&self.session))
+        (!self.completed && self.scene_id.is_some() && player::has_error(&self.session))
             .then(|| player::error_reason(&self.session).to_owned())
     }
     pub fn audio_track(&mut self, ordinal: i32, codec: &str) {
         player::request_audio_track(&mut self.session, ordinal, codec);
     }
-    pub fn subtitle_track(&mut self, ordinal: i32) {
-        player::request_subtitle(ordinal);
+    pub fn completed(&self) -> bool {
+        self.completed
     }
-    pub fn cycle_audio(&mut self) {
-        let selected = player::SHARED
-            .desired_audio_idx
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let next = {
-            let tracks = player::SHARED
-                .track_names
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let count = tracks.audio_codecs.len();
-            (1..=count)
-                .map(|step| (selected.max(-1) + step as i32).rem_euclid(count as i32) as usize)
-                .find_map(|index| {
-                    let codec = &tracks.audio_codecs[index];
-                    matches!(codec.as_str(), "aac" | "ac3" | "eac3" | "dts")
-                        .then(|| (index as i32, codec.clone()))
-                })
-        };
-        if let Some((ordinal, codec)) = next {
-            if ordinal != selected {
-                self.audio_track(ordinal, &codec);
-            }
-        }
+    pub fn loading(&self) -> bool {
+        !self.completed && self.scene_id.is_some() && player::loading(&self.session)
     }
-    pub fn cycle_subtitle(&mut self) {
-        let count = player::SHARED
+    pub fn o_pending(&self) -> bool {
+        self.o_pending
+    }
+    pub fn audio_tracks(&self) -> Vec<String> {
+        player::SHARED
+            .track_names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .audio
+            .clone()
+    }
+    pub fn subtitle_tracks(&self) -> Vec<String> {
+        player::SHARED
             .track_names
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .subs
-            .len() as i32;
-        let selected = player::SHARED
-            .desired_sub_idx
-            .load(std::sync::atomic::Ordering::Relaxed);
-        self.subtitle_track(if selected + 1 >= count {
-            -1
-        } else {
-            selected + 1
-        });
+            .clone()
     }
+    pub fn selected_audio(&self) -> i32 {
+        player::SHARED
+            .desired_audio_idx
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn selected_subtitle(&self) -> i32 {
+        player::SHARED
+            .desired_sub_idx
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn select_audio(&mut self, ordinal: i32) {
+        let codec = player::SHARED
+            .track_names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .audio_codecs
+            .get(ordinal.max(0) as usize)
+            .cloned();
+        if let Some(codec) = codec.filter(|_| ordinal >= 0) {
+            self.audio_track(ordinal, &codec);
+        }
+    }
+    pub fn subtitle_track(&mut self, ordinal: i32) {
+        player::request_subtitle(ordinal);
+    }
+}
+fn completion_flush(
+    history: Option<&mut HistoryTracker>,
+    completed: &mut bool,
+) -> Option<HistoryCommand> {
+    if *completed {
+        return None;
+    }
+    let command = history?.flush(true);
+    *completed = true;
+    Some(command)
 }
 impl Drop for Playback {
     fn drop(&mut self) {
@@ -483,6 +526,34 @@ fn select_stream(scene: &Scene) -> Option<Selected> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn natural_completion_flushes_once_and_retains_counter_gate() {
+        let mut history = HistoryTracker::new("scene-1".into());
+        let _ = history.tick(Duration::from_secs(5), 98.0, true);
+        let mut completed = false;
+        assert_eq!(
+            completion_flush(Some(&mut history), &mut completed),
+            Some(HistoryCommand::SaveActivity {
+                id: "scene-1".into(),
+                resume_time: 0.0,
+                watched_delta: 5.0,
+            })
+        );
+        assert!(completed);
+        assert!(completion_flush(Some(&mut history), &mut completed).is_none());
+        assert_eq!(
+            history.o_key(true),
+            Some(HistoryCommand::AddO {
+                id: "scene-1".into()
+            })
+        );
+        assert!(history.o_key(true).is_none());
+        history.o_key(false);
+        assert!(history.o_key(true).is_none());
+        history.o_key(false);
+        history.o_finished();
+        assert!(history.o_key(true).is_some());
+    }
     #[test]
     fn incompatible_source_never_uses_direct_url() {
         let scene = Scene {

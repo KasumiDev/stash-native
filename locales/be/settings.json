@@ -259,5 +259,11 @@
   "settings.consent.placeholder.random_id": "выпадковы id",
   "settings.consent.placeholder.project_key": "ключ праекта",
   "settings.consent.placeholder.app_version": "версія праграмы",
-  "settings.consent.placeholder.webos_codename_short": "кодавая назва webOS"
+  "settings.consent.placeholder.webos_codename_short": "кодавая назва webOS",
+  "settings.stash.server_url": "Server URL",
+  "settings.stash.api_key": "API key",
+  "settings.stash.optional": "Optional",
+  "settings.stash.testing": "Testing connection…",
+  "settings.stash.test_save": "Test and save",
+  "settings.stash.test_again": "Test and save again"
 }

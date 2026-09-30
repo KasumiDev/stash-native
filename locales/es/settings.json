@@ -78,7 +78,7 @@
   "settings.consent.preview_policy": "Toda la política de privacidad de StashNative para esta versión.",
   "settings.consent.preview_errors_id": "El ID de tus informes de fallos y cómo pedir que se borren.",
   "settings.consent.preview_analytics_id": "El identificador de tus análisis y cómo pedir que se borren.",
-  "settings.consent.delete_detail": "Cerrar sesión y borrar los datos de StashNative de este televisor.",
+  "settings.consent.delete_detail": "Cerrar sesión y borrar datos de StashNative de este televisor.",
   "settings.consent.errors_subtitle": "El identificador aleatorio adjunto a los informes de fallos y errores de esta sesión, y cómo pedir que se borren.",
   "settings.consent.analytics_subtitle": "El identificador aleatorio adjunto a los análisis de esta sesión, y cómo pedir que se borren esos eventos.",
   "settings.consent.policy_subtitle": "Cómo gestiona StashNative los datos locales, los servicios de Plex y los informes opcionales.",
@@ -257,5 +257,11 @@
   "settings.consent.placeholder.random_id": "id aleatorio",
   "settings.consent.placeholder.project_key": "clave del proyecto",
   "settings.consent.placeholder.app_version": "versión de la app",
-  "settings.consent.placeholder.webos_codename_short": "nombre en clave de webOS"
+  "settings.consent.placeholder.webos_codename_short": "nombre en clave de webOS",
+  "settings.stash.server_url": "Server URL",
+  "settings.stash.api_key": "API key",
+  "settings.stash.optional": "Optional",
+  "settings.stash.testing": "Testing connection…",
+  "settings.stash.test_save": "Test and save",
+  "settings.stash.test_again": "Test and save again"
 }

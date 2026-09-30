@@ -14,6 +14,8 @@ pub struct Scene {
     pub id: String,
     pub title: Option<String>,
     pub date: Option<String>,
+    pub details: Option<String>,
+    pub studio: Option<Studio>,
     #[serde(deserialize_with = "null_default")]
     pub o_counter: i64,
     #[serde(deserialize_with = "null_default")]
@@ -28,6 +30,13 @@ pub struct Scene {
     pub scene_streams: Vec<SceneStream>,
     pub performers: Vec<Performer>,
     pub tags: Vec<Tag>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Studio {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
