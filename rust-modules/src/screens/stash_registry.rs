@@ -131,6 +131,7 @@ impl Mounter<StashHost> for Mount {
                 id.clone(),
                 entry,
             )),
+            StashArg::Performer(id) => Box::new(crate::screens::stash::PerformerScreen::new(id.clone(), entry)),
             StashArg::Player(id) => Box::new(crate::screens::stash::player::PlayerScreen::new(
                 id.clone(),
                 entry,

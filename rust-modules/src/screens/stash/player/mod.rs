@@ -1,4 +1,5 @@
 //! Stash transport composed from the original shared video-plane HUD.
+mod markers;
 use crate::screens::stash_registry::*;
 use crate::ui::frame::Budget;
 use crate::ui::machine::*;
@@ -16,6 +17,8 @@ struct State {
     panel: u8,
     scrub: Option<f64>,
     completed: bool,
+    expanded: bool,
+    markers_loaded: bool,
 }
 impl LogicalState for State {
     fn write(&self, c: &mut Canon) {
@@ -23,6 +26,8 @@ impl LogicalState for State {
             .bool(self.dismissed)
             .u32(self.panel as u32)
             .bool(self.completed)
+            .bool(self.expanded)
+            .bool(self.markers_loaded)
             .f32(self.scrub.unwrap_or(-1.) as f32);
     }
     fn probe(&self, s: &mut String) {
@@ -38,6 +43,8 @@ pub struct PlayerScreen {
     state: State,
     row: TransportRow,
     subtitles: player_hud::SubtitleBitmaps,
+    markers: markers::Markers,
+    offset: crate::ui::Spring,
 }
 impl PlayerScreen {
     pub fn new(id: String, entry: EntryId) -> Self {
@@ -47,11 +54,14 @@ impl PlayerScreen {
             state: State::default(),
             row: TransportRow::new(),
             subtitles: player_hud::SubtitleBitmaps::new(),
+            markers: markers::Markers::default(),
+            offset: crate::ui::Spring::at(0.),
         }
     }
     fn visible(&self, cx: &Cx<'_, StashHost>) -> bool {
         cx.views.playback.completed
             || self.state.panel != 0
+            || self.state.expanded
             || cx.views.playback.loading
             || (!self.state.dismissed
                 && (!cx.views.playback.playing || cx.tick.ms < self.state.until))
@@ -71,7 +81,11 @@ impl PlayerScreen {
             };
             (100..100 + n as u32).collect()
         } else if self.visible(cx) {
-            vec![0, 1, 2, 3, 4]
+            let mut keys = vec![0, 1, 2, 3];
+            if self.state.expanded {
+                keys.extend_from_slice(self.markers.keys());
+            }
+            keys
         } else {
             Vec::new()
         }
@@ -80,14 +94,16 @@ impl PlayerScreen {
         if !self.keys(cx).contains(&key) {
             return None;
         }
-        Some(match key {
+        if self.markers.contains(key) {
+            return self.markers.rect(key, self.offset.pos);
+        }
+        let mut rect = match key {
             0 => player_hud::scrub_hit_rect(),
             1 | 2 => player_hud::disc_hit_rect((key - 1) as i32),
             3 => {
                 let r = player_hud::disc_hit_rect(2);
                 Rect::new(r.x - 24., r.y, 112., r.h)
             }
-            4 => Rect::new(72., 962., 240., 64.),
             10 => Rect::new(670., 620., 260., 64.),
             11 => Rect::new(970., 620., 260., 64.),
             _ => {
@@ -104,14 +120,24 @@ impl PlayerScreen {
                     60.,
                 )
             }
-        })
+        };
+        if key <= 3 {
+            rect.y -= self.offset.pos;
+        }
+        Some(rect)
     }
     fn emit(&self, action: Action, fx: &mut Effects<'_, StashHost>) {
         fx.push(Fx::App(StashFx::Player(action)));
     }
     fn activate(&mut self, key: u32, cx: &Cx<'_, StashHost>, fx: &mut Effects<'_, StashHost>) {
         self.reveal(cx.tick.ms);
+        if let Some(seconds) = self.markers.seconds(key) {
+            self.state.scrub = None;
+            self.emit(Action::SeekTo(seconds), fx);
+            return;
+        }
         match key {
+            0 if !cx.views.playback.completed => self.emit(Action::Pause, fx),
             1 => {
                 self.state.panel = 2;
             }
@@ -119,7 +145,6 @@ impl PlayerScreen {
                 self.state.panel = 1;
             }
             3 | 11 if !cx.views.playback.o_pending => self.emit(Action::AddO, fx),
-            4 => self.emit(Action::Pause, fx),
             10 => {
                 self.state.completed = false;
                 self.emit(Action::Replay, fx);
@@ -164,21 +189,40 @@ impl Focusable<StashHost> for PlayerScreen {
         let Some(i) = keys.iter().position(|x| *x == k.elem) else {
             return Step::Edge;
         };
-        if k.elem == 0 && matches!(d, Dir::Left | Dir::Right) {
-            return Step::Edge;
-        }
-        let next = match d {
-            Dir::Left | Dir::Up => i.checked_sub(1),
-            Dir::Right | Dir::Down => (i + 1 < keys.len()).then_some(i + 1),
+        let next = if !cx.views.playback.completed && self.state.panel == 0 {
+            if self.markers.contains(k.elem) {
+                match d {
+                    Dir::Left => self.markers.neighbour(k.elem, false),
+                    Dir::Right => self.markers.neighbour(k.elem, true),
+                    Dir::Up => Some(0),
+                    Dir::Down => None,
+                }
+            } else {
+                match d {
+                    Dir::Down if k.elem == 0 => self.markers.near(cx.views.playback.position),
+                    Dir::Down => Some(0),
+                    Dir::Up if k.elem == 0 => Some(1),
+                    Dir::Up => None,
+                    Dir::Left if k.elem > 1 => Some(k.elem - 1),
+                    Dir::Right if k.elem > 0 && k.elem < 3 => Some(k.elem + 1),
+                    _ => None,
+                }
+            }
+        } else {
+            match d {
+                Dir::Left | Dir::Up => i.checked_sub(1).map(|i| keys[i]),
+                Dir::Right | Dir::Down => keys.get(i + 1).copied(),
+            }
         };
-        next.map(|i| {
+        next.map(|elem| {
             Step::Move(FocusKey {
                 entry: self.entry,
-                elem: keys[i],
+                elem,
             })
         })
         .unwrap_or(Step::Edge)
     }
+
     fn place(&self, k: &u32, cx: &Cx<'_, StashHost>, _: At) -> Option<Placed> {
         let r = self.rect(*k, cx)?;
         Some(Placed {
@@ -214,18 +258,86 @@ impl Machine<StashHost> for PlayerScreen {
         fx: &mut Effects<'_, StashHost>,
     ) -> Handled {
         let handled = match ev {
-            ScreenEvent::Unmount | ScreenEvent::Suspend => {
+            ScreenEvent::Unmount | ScreenEvent::Suspend | ScreenEvent::Cover => {
+                fx.push(Fx::App(StashFx::Media(Vec::new(), None)));
                 self.subtitles.release();
                 Handled::Yes
             }
-            ScreenEvent::Mount | ScreenEvent::Uncover => {
+            ScreenEvent::Mount => {
+                self.reveal(cx.tick.ms);
+                self.markers.sync(
+                    cx.views
+                        .playback
+                        .scene
+                        .as_ref()
+                        .map_or(&[], |s| s.scene_markers.as_slice()),
+                );
+                fx.push(Fx::App(StashFx::Work(
+                    Addr {
+                        to: fx.from(),
+                        req: RequestId(1),
+                    },
+                    crate::stores::stash::Work::Load {
+                        route: StashArg::Scene(self.id.clone()),
+                        query: crate::stash::Query::default(),
+                        generation: 1,
+                    },
+                )));
+                Handled::Yes
+            }
+            ScreenEvent::Async(
+                _,
+                StashMsg::Loaded {
+                    generation: 1,
+                    result: Ok(data),
+                },
+            ) => {
+                if let Some(scene) = data.scene.as_ref().filter(|s| s.id == self.id) {
+                    self.markers.sync(&scene.scene_markers);
+                    self.state.markers_loaded = true;
+                }
+                Handled::Yes
+            }
+            ScreenEvent::Uncover => {
                 self.reveal(cx.tick.ms);
                 Handled::Yes
             }
             ScreenEvent::Tick(t) => {
+                if !self.state.markers_loaded {
+                    self.markers.sync(
+                        cx.views
+                            .playback
+                            .scene
+                            .as_ref()
+                            .map_or(&[], |s| s.scene_markers.as_slice()),
+                    );
+                }
+                if self.markers.empty() {
+                    self.state.expanded = false;
+                }
+                self.offset.step(
+                    if self.state.expanded {
+                        markers::SHIFT
+                    } else {
+                        0.
+                    },
+                    220.,
+                    t.dt(),
+                );
+                self.markers
+                    .update(cx.focus.current.map(|k| k.elem), t.dt());
+                fx.push(Fx::App(StashFx::Media(
+                    if self.state.expanded {
+                        self.markers.images(self.offset.pos)
+                    } else {
+                        Vec::new()
+                    },
+                    None,
+                )));
                 if cx.views.playback.completed && !self.state.completed {
                     self.state.completed = true;
                     self.state.panel = 0;
+                    self.state.expanded = false;
                     self.state.scrub = None;
                 }
                 let focus = cx.focus.current.map(|k| k.elem).unwrap_or(0);
@@ -242,7 +354,8 @@ impl Machine<StashHost> for PlayerScreen {
                 self.activate(*k, cx, fx);
                 Handled::Yes
             }
-            ScreenEvent::FocusMoved { .. } => {
+            ScreenEvent::FocusMoved { to, .. } => {
+                self.state.expanded = self.markers.contains(to.elem);
                 self.reveal(cx.tick.ms);
                 Handled::Yes
             }
@@ -267,6 +380,9 @@ impl Machine<StashHost> for PlayerScreen {
                 if self.state.panel != 0 {
                     self.state.panel = 0;
                     self.reveal(cx.tick.ms);
+                } else if self.state.expanded {
+                    self.state.expanded = false;
+                    self.reveal(cx.tick.ms);
                 } else {
                     self.emit(Action::Open(StashArg::Scene(self.id.clone())), fx);
                     fx.push(Fx::Nav(NavOp::Pop));
@@ -283,8 +399,27 @@ impl Machine<StashHost> for PlayerScreen {
                 ..
             }) if matches!(key, Key::Left | Key::Right | Key::Up | Key::Down | Key::Ok) => {
                 if !self.visible(cx) {
+                    if *key == Key::Ok && !cx.views.playback.completed { self.emit(Action::Pause, fx); }
                     self.reveal(cx.tick.ms);
                     Handled::Yes
+                } else if !cx.views.playback.completed
+                    && self.state.panel == 0
+                    && *key == Key::Up
+                    && cx.focus.current.is_some_and(|k| (1..=3).contains(&k.elem))
+                {
+                    self.state.expanded = false;
+                    self.state.dismissed = true;
+                    self.state.scrub = None;
+                    Handled::Yes
+                } else if !cx.views.playback.completed
+                    && self.state.panel == 0
+                    && *key == Key::Down
+                    && cx.focus.current.is_some_and(|k| k.elem == 0)
+                    && !self.markers.empty()
+                {
+                    self.state.expanded = true;
+                    self.reveal(cx.tick.ms);
+                    Handled::No
                 } else if !cx.views.playback.completed
                     && self.state.panel == 0
                     && matches!(key, Key::Left | Key::Right)
@@ -450,18 +585,24 @@ impl Screen<StashHost> for PlayerScreen {
             if !self.visible(f.cx) {
                 return;
             }
+            let hud = p.translate(0., -self.offset.pos);
             player_hud::draw_scrim(p);
+            if self.offset.pos > 0. {
+                player_hud::draw_scrim(hud);
+            }
             let title = view.scene.as_ref().map(|s| s.display_title()).unwrap_or("");
             let title = CString::new(title.replace('\0', "")).unwrap_or_default();
             let count = CString::new(crate::i18n::msg::stash_player_count(view.o_count))
                 .unwrap_or_default();
-            player_hud::draw_title(
-                p,
+            player_hud::draw_title_fitted(
+                hud,
                 player_hud::Kicker::Context(count.as_ptr()),
                 title.as_ptr(),
+                player_hud::disc_hit_rect(0).x - 32.,
+                f.cx.measure,
             );
             player_hud::draw_playbar(
-                p,
+                hud,
                 Playbar {
                     pos_ns: (self.state.scrub.unwrap_or(view.position) * 1e9) as i64,
                     dur_ns: (view.duration * 1e9) as i64,
@@ -494,6 +635,15 @@ impl Screen<StashHost> for PlayerScreen {
                 theme::size::TITLE,
             );
         }
+        if self.state.expanded && self.state.panel == 0 && !view.completed {
+            self.markers.draw(
+                p,
+                f.cx.views.textures,
+                f.cx.focus.current.map(|k| k.elem),
+                self.offset.pos,
+                f.cx.measure,
+            );
+        }
         for key in self.keys(f.cx) {
             let Some(rect) = self.rect(key, f.cx) else {
                 continue;
@@ -519,7 +669,7 @@ impl Screen<StashHost> for PlayerScreen {
                     },
                 },
             );
-            if key == 0 {
+            if key == 0 || self.markers.contains(key) {
                 continue;
             }
             let focused =
@@ -536,7 +686,6 @@ impl Screen<StashHost> for PlayerScreen {
             }
             let label = match key {
                 3 | 11 => crate::i18n::msg::stash_player_o_plus().to_owned(),
-                4 => crate::i18n::msg::stash_player_play_pause().to_owned(),
                 10 => crate::i18n::msg::stash_player_replay().to_owned(),
                 n if self.state.panel == 1 => view
                     .audio
@@ -615,6 +764,95 @@ mod tests {
         assert_eq!(player_hud::disc_hit_rect(0).h, 64.);
     }
     #[test]
+    fn original_up_ring_reaches_controls_then_hides() {
+        context(&PlaybackView::default(), |cx| {
+            let mut screen = PlayerScreen::new("1".into(), EntryId(1));
+            let focus = FocusKey {
+                entry: EntryId(1),
+                elem: 0,
+            };
+            assert!(matches!(
+                screen.neighbour(focus, Dir::Up, cx),
+                Step::Move(FocusKey { elem: 1, .. })
+            ));
+            let mut cx = Cx {
+                views: cx.views,
+                tick: cx.tick,
+                measure: cx.measure,
+                press: cx.press,
+                focus: cx.focus.clone(),
+                owner: cx.owner,
+            };
+            cx.focus.current = Some(FocusKey {
+                entry: EntryId(1),
+                elem: 1,
+            });
+            let mut out = Vec::new();
+            let mut present = crate::ui::present::Present::new();
+            let mut fx = Effects::new(&mut out, MachineId::Instance(InstanceId(1)), &mut present);
+            let event = ScreenEvent::Input(InputEvent {
+                at: Tick::default(),
+                source: Source::Script,
+                kind: InputKind::Key {
+                    key: Key::Up,
+                    sym: 0,
+                    wcode: 0,
+                    edge: Edge::Down,
+                    at_edge: true,
+                },
+            });
+            assert!(matches!(screen.step(&event, &cx, &mut fx), Handled::Yes));
+            assert!(screen.state.dismissed);
+        });
+    }
+    #[test]
+    fn marker_activation_only_emits_seek_and_preserves_pause_state() {
+        let mut scene = crate::stash::Scene::default();
+        scene.scene_markers.push(crate::stash::SceneMarker {
+            id: "m".into(),
+            title: "Chapter".into(),
+            seconds: 29.4,
+            ..Default::default()
+        });
+        context(
+            &PlaybackView {
+                scene: Some(scene.clone()),
+                playing: false,
+                ..Default::default()
+            },
+            |cx| {
+                let mut screen = PlayerScreen::new("1".into(), EntryId(1));
+                screen.markers.sync(&scene.scene_markers);
+                screen.state.expanded = true;
+                let key = screen.markers.keys()[0];
+                assert!(
+                    matches!(screen.neighbour(FocusKey { entry: EntryId(1), elem: 0 }, Dir::Down, cx), Step::Move(FocusKey { elem, .. }) if elem == key)
+                );
+                assert!(matches!(
+                    screen.neighbour(
+                        FocusKey {
+                            entry: EntryId(1),
+                            elem: key
+                        },
+                        Dir::Up,
+                        cx
+                    ),
+                    Step::Move(FocusKey { elem: 0, .. })
+                ));
+                let mut out = Vec::new();
+                let mut present = crate::ui::present::Present::new();
+                let mut fx =
+                    Effects::new(&mut out, MachineId::Instance(InstanceId(1)), &mut present);
+                screen.activate(key, cx, &mut fx);
+                assert_eq!(out.len(), 1);
+                assert!(
+                    matches!(&out[0].fx, Fx::App(StashFx::Player(Action::SeekTo(p))) if *p == 29.4)
+                );
+                assert!(!cx.views.playback.playing);
+            },
+        );
+    }
+    #[test]
     fn bitmap_subtitle_gpu_storage_is_reported() {
         let mut screen = PlayerScreen::new("1".into(), EntryId(1));
         assert_eq!(
@@ -628,10 +866,10 @@ mod tests {
         );
     }
     #[test]
-    fn live_hud_has_scrub_tracks_counter_and_transport_only() {
+    fn live_hud_has_scrub_tracks_and_counter_without_redundant_pause() {
         context(&PlaybackView::default(), |cx| {
             let screen = PlayerScreen::new("1".into(), EntryId(1));
-            assert_eq!(screen.keys(cx), [0, 1, 2, 3, 4]);
+            assert_eq!(screen.keys(cx), [0, 1, 2, 3]);
             for (key, expected) in [
                 (0, player_hud::scrub_hit_rect()),
                 (1, player_hud::disc_hit_rect(0)),

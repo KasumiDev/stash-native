@@ -45,7 +45,7 @@ impl HomeScreen {
     fn play_label(&self) -> &'static std::ffi::CStr {
         if self.shelves.loading() {
             crate::i18n::msg::browse_home_loading_c()
-        } else if self.scene().is_none() || !self.shelves.error().is_empty() {
+        } else if self.scene().is_none() {
             crate::i18n::msg::browse_action_retry_c()
         } else if self.scene().is_some_and(|s| s.resume_time > 0.) {
             crate::i18n::msg::browse_home_continue_c()
@@ -53,21 +53,19 @@ impl HomeScreen {
             crate::i18n::msg::browse_detail_play_c()
         }
     }
-    fn rects(&self, cx: &Cx<'_, StashHost>) -> [Rect; 4] {
+    fn rects(&self, cx: &Cx<'_, StashHost>) -> [Rect; 2] {
         let label = self.play_label();
         let w = cx.measure.width(label, theme::size::BODY, true) + 96.;
         let y = landing_hero::TEXT_BOTTOM + theme::space::MD - self.snap.pos * SNAP_EXTENT;
         [
             Rect::new(96., y, w, 60.),
             Rect::new(96. + w + 16., y, 60., 60.),
-            Rect::new(96. + w + 92., y + 7., 46., 46.),
-            Rect::new(96. + w + 154., y + 7., 46., 46.),
         ]
     }
     fn hero<R>(&self, cx: &Cx<'_, StashHost>, f: impl FnOnce(TabRow<'_>) -> R) -> R {
         let rects = self.rects(cx);
         f(TabRow {
-            rects: &rects[..if self.scene().is_some() { 4 } else { 1 }],
+            rects: &rects[..if self.scene().is_some() { 2 } else { 1 }],
             group: GROUP,
             entry: self.entry,
         })
@@ -80,16 +78,12 @@ impl HomeScreen {
             self.auto_at = now;
         }
     }
-    fn activate(&mut self, key: u32, cx: &Cx<'_, StashHost>, fx: &mut Effects<'_, StashHost>) {
+    fn activate(&mut self, key: u32, _cx: &Cx<'_, StashHost>, fx: &mut Effects<'_, StashHost>) {
         if let Some(arg) = strip_destination(key) {
             fx.push(Fx::Nav(NavOp::Root(arg)));
             return;
         }
-        if key == HERO
-            && (self.shelves.loading()
-                || self.scene().is_none()
-                || !self.shelves.error().is_empty())
-        {
+        if key == HERO && (self.shelves.loading() || self.scene().is_none()) {
             self.shelves.retry(fx);
             fx.invalidate(crate::ui::present::Provenance::Input);
             return;
@@ -109,8 +103,6 @@ impl HomeScreen {
                     fx.push(Fx::Nav(NavOp::Push(StashArg::Scene(scene.id.clone()))));
                 }
             }
-            Some(2) => self.flip(-1, cx.tick.ms),
-            Some(3) => self.flip(1, cx.tick.ms),
             _ => {}
         }
         fx.invalidate(crate::ui::present::Provenance::Input);
@@ -132,14 +124,14 @@ impl Focusable<StashHost> for HomeScreen {
         self.shelves.groups(cx, out);
     }
     fn group_of(&self, key: &u32, cx: &Cx<'_, StashHost>) -> Option<GroupId> {
-        if (HERO..HERO + 4).contains(key) {
+        if (HERO..HERO + 2).contains(key) {
             Some(GROUP)
         } else {
             self.shelves.group_of(key, cx)
         }
     }
     fn neighbour(&self, key: FocusKey<u32>, dir: Dir, cx: &Cx<'_, StashHost>) -> Step<u32> {
-        if (HERO..HERO + 4).contains(&key.elem) {
+        if (HERO..HERO + 2).contains(&key.elem) {
             self.hero(cx, |g| {
                 match g.neighbour(
                     FocusKey {
@@ -161,14 +153,14 @@ impl Focusable<StashHost> for HomeScreen {
         }
     }
     fn place(&self, key: &u32, cx: &Cx<'_, StashHost>, at: At) -> Option<Placed> {
-        if (HERO..HERO + 4).contains(key) {
+        if (HERO..HERO + 2).contains(key) {
             self.hero(cx, |g| g.place(&(*key - HERO), cx, at))
         } else {
             self.shelves.place(key, cx, at)
         }
     }
     fn reconcile(&self, key: FocusKey<u32>, cx: &Cx<'_, StashHost>) -> FocusKey<u32> {
-        if (HERO..HERO + 4).contains(&key.elem) {
+        if (HERO..HERO + 2).contains(&key.elem) {
             key
         } else {
             self.shelves.reconcile(key, cx)
@@ -197,6 +189,28 @@ impl Machine<StashHost> for HomeScreen {
         fx: &mut Effects<'_, StashHost>,
     ) -> Handled {
         match event {
+            ScreenEvent::Input(InputEvent {
+                kind:
+                    InputKind::Key {
+                        key,
+                        edge: Edge::Down | Edge::Repeat,
+                        at_edge,
+                        ..
+                    },
+                ..
+            }) if *at_edge
+                && matches!(key, Key::Left | Key::Right)
+                && cx
+                    .focus
+                    .current
+                    .is_some_and(|k| (HERO..HERO + 2).contains(&k.elem)) =>
+            {
+                self.flip(if *key == Key::Left { -1 } else { 1 }, cx.tick.ms);
+                fx.invalidate(crate::ui::present::Provenance::Input);
+                self.shelves.media_override(Vec::new(), self.hero_preview());
+                return Handled::Yes;
+            }
+            ScreenEvent::Input(_) => self.auto_at = cx.tick.ms,
             ScreenEvent::Activate(key) if *key >= HERO => {
                 self.activate(*key, cx, fx);
                 return Handled::Yes;
@@ -239,6 +253,7 @@ impl Machine<StashHost> for HomeScreen {
             }
             _ => {}
         }
+        self.shelves.media_override(Vec::new(), self.hero_preview());
         let result = self.shelves.step(event, cx, fx);
         if matches!(result, Handled::Yes)
             && matches!(event, ScreenEvent::Async(_, StashMsg::Loaded { .. }))
@@ -252,6 +267,19 @@ impl Machine<StashHost> for HomeScreen {
             self.auto_at = cx.tick.ms;
         }
         result
+    }
+}
+impl HomeScreen {
+    fn hero_preview(&self) -> Option<(String, String)> {
+        if self.covered || self.target >= 0.5 {
+            return None;
+        }
+        self.scene().and_then(|s| {
+            s.paths
+                .preview
+                .as_ref()
+                .map(|url| (format!("hero:{}", s.id), url.clone()))
+        })
     }
 }
 impl Screen<StashHost> for HomeScreen {
@@ -305,7 +333,12 @@ impl Screen<StashHost> for HomeScreen {
         let a = crate::ui::hero_alpha(self.snap.pos, 0.8);
         let p = f.painter;
         if let Some(scene) = self.scene() {
-            if let Some((tex, w, h)) = f.cx.views.textures.get(&format!("hero:{}", scene.id)) {
+            if let Some((tex, w, h)) =
+                f.cx.views
+                    .textures
+                    .get(&format!("preview:hero:{}", scene.id))
+                    .or_else(|| f.cx.views.textures.get(&format!("hero:{}", scene.id)))
+            {
                 p.alpha(a).tex_uv(
                     *tex,
                     Rect::FULL.cover_uv(*w, *h, crate::ui::Crop::Centre),
@@ -384,7 +417,7 @@ impl Screen<StashHost> for HomeScreen {
         let env = Env::inert();
         let rects = self.rects(f.cx);
         let label = self.play_label();
-        let count = if self.scene().is_some() { 4 } else { 1 };
+        let count = if self.scene().is_some() { 2 } else { 1 };
         for (i, rect) in rects.into_iter().take(count).enumerate() {
             let key = FocusKey {
                 entry: self.entry,
@@ -408,13 +441,7 @@ impl Screen<StashHost> for HomeScreen {
                     .focused(focused)
                     .draw(&env, hero);
             } else {
-                let icon = if i == 1 {
-                    Icon::Info
-                } else if i == 2 {
-                    Icon::ChevronLeft
-                } else {
-                    Icon::Chevron
-                };
+                let icon = Icon::Info;
                 CircleButton::new(c"".as_ptr())
                     .icon(icon)
                     .frame(rect)
@@ -441,6 +468,10 @@ mod tests {
                 id: i.to_string(),
                 title: Some(format!("Scene {i}")),
                 details: Some("Synthetic synopsis".into()),
+                paths: crate::stash::ScenePaths {
+                    preview: Some(format!("fixture://preview/{i}")),
+                    ..Default::default()
+                },
                 ..Default::default()
             })
             .collect::<Vec<_>>();
@@ -451,6 +482,7 @@ mod tests {
                 Section {
                     title: "Newest scenes".into(),
                     portrait: false,
+                    shelf: true,
                     tiles: vec![Tile {
                         identity: "scene:1".into(),
                         title: "Scene 1".into(),
@@ -463,6 +495,7 @@ mod tests {
                 Section {
                     title: "Performers".into(),
                     portrait: true,
+                    shelf: true,
                     tiles: vec![Tile {
                         identity: "performer:1".into(),
                         title: "Favorite performer".into(),
@@ -518,10 +551,32 @@ mod tests {
         assert!(home.shelves.test_content_key("scene:1").is_none());
         assert!(home.shelves.test_content_key("performer:1").is_some());
         assert!(home.place(&HERO, &cx, At::Drawn).is_some());
+        assert!(home.place(&(HERO + 1), &cx, At::Drawn).is_some());
+        assert!(home.place(&(HERO + 2), &cx, At::Drawn).is_none());
+        assert!(matches!(
+            home.neighbour(
+                FocusKey {
+                    entry: EntryId(1),
+                    elem: HERO + 1
+                },
+                Dir::Right,
+                &cx
+            ),
+            Step::Edge
+        ));
+        assert_eq!(
+            home.hero_preview(),
+            Some(("hero:1".into(), "fixture://preview/1".into()))
+        );
         home.flip(-1, 20);
         assert_eq!(home.scene().unwrap().id, "12");
         home.flip(1, 30);
         assert_eq!(home.scene().unwrap().id, "1");
+        home.covered = true;
+        assert_eq!(home.hero_preview(), None);
+        home.covered = false;
+        home.target = 1.;
+        assert_eq!(home.hero_preview(), None);
     }
     #[test]
     fn failed_billboard_load_retains_an_actionable_retry() {

@@ -30,6 +30,26 @@ pub struct Scene {
     pub scene_streams: Vec<SceneStream>,
     pub performers: Vec<Performer>,
     pub tags: Vec<Tag>,
+    pub scene_markers: Vec<SceneMarker>,
+}
+
+/// Marker artwork is still imagery; activating a marker seeks within the current session.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SceneMarker {
+    pub id: String,
+    pub title: String,
+    pub seconds: f64,
+    pub end_seconds: Option<f64>,
+    pub screenshot: Option<String>,
+}
+
+/// The small projection used to count a performer's tags without downloading scene media.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SceneTagSummary {
+    pub id: String,
+    pub tags: Vec<Tag>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -76,6 +96,11 @@ pub struct Performer {
     pub favorite: bool,
     #[serde(deserialize_with = "null_default")]
     pub o_counter: i64,
+    pub details: Option<String>,
+    pub birthdate: Option<String>,
+    pub death_date: Option<String>,
+    pub hair_color: Option<String>,
+    pub tags: Vec<Tag>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -128,5 +153,20 @@ impl Gallery {
             .as_deref()
             .filter(|s| !s.is_empty())
             .unwrap_or("Untitled gallery")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn detail_metadata_accepts_absent_optional_marker_artwork_and_performer_facts() {
+        let scene:Scene=serde_json::from_value(serde_json::json!({"id":"19","scene_markers":[{"id":"2","title":"Marker","seconds":29.4,"end_seconds":null,"screenshot":null}],"performers":[{"id":"1","name":"Fixture","details":null,"birthdate":null,"hair_color":null,"tags":[]}]})).unwrap();
+        assert_eq!(scene.scene_markers.len(), 1);
+        assert_eq!(scene.scene_markers[0].seconds, 29.4);
+        assert!(scene.scene_markers[0].screenshot.is_none());
+        assert!(scene.performers[0].birthdate.is_none());
+        let list: Scene = serde_json::from_value(serde_json::json!({"id":"19"})).unwrap();
+        assert!(list.scene_markers.is_empty());
     }
 }

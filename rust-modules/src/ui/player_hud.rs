@@ -1367,6 +1367,26 @@ pub(crate) fn draw_title(p: Painter, kicker: Kicker, title: *const std::os::raw:
     );
 }
 
+/// The same title block with a measured right boundary supplied by its control row.
+/// The caller owns both C strings across the draw, as with `draw_title`.
+pub(crate) fn draw_title_fitted(
+    p: Painter, kicker: Kicker, title: *const std::os::raw::c_char,
+    right: f32, measure: &dyn crate::ui::machine::Measure,
+) {
+    let title = if title.is_null() { String::new() } else {
+        // SAFETY: this uses the same caller-owned NUL-terminated text contract as draw_title.
+        unsafe { std::ffi::CStr::from_ptr(title) }.to_string_lossy().into_owned()
+    };
+    let fitted = fit_title(&title, right, measure);
+    let fitted = CString::new(fitted.replace('\0', "")).unwrap_or_default();
+    draw_title(p, kicker, fitted.as_ptr());
+}
+
+fn fit_title(title: &str, right: f32, measure: &dyn crate::ui::machine::Measure) -> String {
+    crate::text::elide_by(title, (right - SB_X).max(1.), false,
+        |s| measure.width_str(s, HUD_TITLE_SZ, true))
+}
+
 /// How the playhead is drawn — see [`draw_playbar`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Knob {
@@ -1783,6 +1803,22 @@ mod tests {
     use super::*;
     use crate::metadata::{Marker, MarkerKind};
     use crate::screens::player::skip_pill::SkipAction;
+
+    #[test]
+    fn long_title_respects_the_control_row_boundary() {
+        struct Measure;
+        impl crate::ui::machine::Measure for Measure {
+            fn width(&self, text: &std::ffi::CStr, _: i32, _: bool) -> f32 { text.to_string_lossy().chars().count() as f32 * 30. }
+            fn cap_h(&self, _: i32) -> f32 { 40. }
+            fn line_h(&self, _: i32) -> f32 { 60. }
+        }
+        let title = "A long scene title with unicode 👩 and enough words to pass through the right hand controls";
+        let right = disc_hit_rect(0).x - 32.;
+        let fitted = fit_title(title, right, &Measure);
+        assert!(fitted.ends_with('…'));
+        assert!(crate::ui::machine::Measure::width_str(&Measure, &fitted, HUD_TITLE_SZ, true) <= right - SB_X);
+        assert_eq!(fit_title("Short", right, &Measure), "Short");
+    }
 
     /// **The image-subtitle display set is a render, and it says how much of one** (§8.3 rule (c)):
     /// one texture per rect, the SOURCE pixels behind them, and nothing left claimed once the set

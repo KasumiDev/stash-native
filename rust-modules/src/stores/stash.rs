@@ -57,6 +57,11 @@ pub enum StashMsg {
         generation: u32,
         result: Result<Section, String>,
     },
+    PerformerTags {
+        generation: u32,
+        page: u32,
+        result: Result<crate::stash::Page<crate::stash::SceneTagSummary>, String>,
+    },
     Connected(Result<Config, String>),
 }
 use crate::stash::{Client, Config, Direction, Gallery, Image, Performer, Query, Scene, Tag};
@@ -77,6 +82,8 @@ pub struct Section {
     pub title: String,
     pub tiles: Vec<Tile>,
     pub portrait: bool,
+    /// Explicit shelf role; tag names cannot accidentally turn a shelf into a collection grid.
+    pub shelf: bool,
 }
 #[derive(Clone, Debug, Default)]
 pub struct PageData {
@@ -89,8 +96,22 @@ pub struct PageData {
     pub has_more: bool,
     pub images: Vec<Image>,
     pub lazy_tags: Vec<Tag>,
+    pub performer: Option<Performer>,
+    /// Calendar date captured by the query worker, so screens never read a wall clock.
+    pub reference_date: Option<(i32, u32, u32)>,
+    pub shelves_error: Option<String>,
 }
 pub enum Work {
+    PerformerTags {
+        performer_id: String,
+        page: u32,
+        generation: u32,
+    },
+    PerformerTagShelf {
+        performer_id: String,
+        tag: Tag,
+        generation: u32,
+    },
     TagShelf {
         tag: Tag,
         generation: u32,
@@ -118,6 +139,74 @@ impl Worker {
                 let mut config = config;
                 while let Ok((addr, job)) = jobs.recv() {
                     let msg = match job {
+                        Work::PerformerTags {
+                            performer_id,
+                            page,
+                            generation,
+                        } => StashMsg::PerformerTags {
+                            generation,
+                            page,
+                            result: if fixtures {
+                                let q = Query {
+                                    page,
+                                    per_page: 50,
+                                    ..Default::default()
+                                };
+                                let data = fixture(&StashArg::Scenes, &q);
+                                Ok(crate::stash::Page {
+                                    count: data.count,
+                                    items: data
+                                        .scenes
+                                        .into_iter()
+                                        .map(|s| crate::stash::SceneTagSummary {
+                                            id: s.id,
+                                            tags: s.tags,
+                                        })
+                                        .collect(),
+                                })
+                            } else {
+                                Client::new(config.clone()).map_err(err).and_then(|c| {
+                                    c.performer_scene_tags(&performer_id, page).map_err(err)
+                                })
+                            },
+                        },
+                        Work::PerformerTagShelf {
+                            performer_id,
+                            tag,
+                            generation,
+                        } => StashMsg::ShelfLoaded {
+                            generation,
+                            result: if fixtures {
+                                let data = fixture(&StashArg::Scenes, &Query::default());
+                                Ok(shelf(
+                                    &tag.name,
+                                    data.sections
+                                        .into_iter()
+                                        .flat_map(|s| s.tiles)
+                                        .take(12)
+                                        .collect(),
+                                ))
+                            } else {
+                                Client::new(config.clone()).map_err(err).and_then(|c| {
+                                    let q = Query {
+                                        performer_id: Some(performer_id),
+                                        tag_id: Some(tag.id),
+                                        sort: "date".into(),
+                                        direction: Direction::Descending,
+                                        per_page: 12,
+                                        ..Default::default()
+                                    };
+                                    c.scenes(&q)
+                                        .map(|p| {
+                                            shelf(
+                                                &tag.name,
+                                                p.items.into_iter().map(scene).collect(),
+                                            )
+                                        })
+                                        .map_err(err)
+                                })
+                            },
+                        },
                         Work::TagShelf { tag, generation } => StashMsg::ShelfLoaded {
                             generation,
                             result: Client::new(config.clone()).map_err(err).and_then(|c| {
@@ -130,11 +219,7 @@ impl Worker {
                                 };
                                 c.scenes(&q)
                                     .map(|p| {
-                                        section(
-                                            &tag.name,
-                                            p.items.into_iter().map(scene).collect(),
-                                            false,
-                                        )
+                                        shelf(&tag.name, p.items.into_iter().map(scene).collect())
                                     })
                                     .map_err(err)
                             }),
@@ -190,6 +275,12 @@ fn fixture(route: &StashArg, query: &Query) -> PageData {
             favorite: id < 3,
             o_counter: 100 - id,
             image_path: Some(format!("fixture://performer/{id}")),
+            details: Some(
+                "A synthetic performer biography for checking portrait and reading layout.".into(),
+            ),
+            birthdate: Some("1994-08-20".into()),
+            hair_color: Some("Brown".into()),
+            ..Default::default()
         })
         .collect();
     let tags: Vec<_> = (1..=if paged { 70 } else { 3 })
@@ -207,13 +298,14 @@ fn fixture(route: &StashArg, query: &Query) -> PageData {
             date: Some("2026-09-01".into()),
             details: Some("A synthetic scene for checking the shared movie detail layout, navigation, and playback controls.".into()),
             studio: Some(crate::stash::Studio { id: "fixture".into(), name: "Fixture Studio".into() }),
-            files: vec![crate::stash::SceneFile { duration: 1560., width: 1920, height: 1080, video_codec: "h264".into(), audio_codec: "aac".into(), format: "mp4".into() }],
+            files: vec![crate::stash::SceneFile { duration: 1560., width: if id % 3 == 0 { 1080 } else { 1920 }, height: if id % 3 == 0 { 1920 } else { 1080 }, video_codec: "h264".into(), audio_codec: "aac".into(), format: "mp4".into() }],
             resume_time: if id == 1 { 120. } else { 0. },
             o_counter: id,
             paths: crate::stash::ScenePaths {
                 screenshot: Some(format!("fixture://scene/{id}")),
                 ..Default::default()
             },
+            scene_markers: vec![crate::stash::SceneMarker { id:format!("{id}-1"),title:"Opening".into(),seconds:30.,end_seconds:Some(60.),screenshot:Some(format!("fixture://scene/{id}")) }, crate::stash::SceneMarker { id:format!("{id}-2"), title:"Later scene".into(),seconds:180.,..Default::default() }],
             performers: performers[..2].to_vec(),
             tags: tags.clone(),
             ..Default::default()
@@ -243,6 +335,9 @@ fn fixture(route: &StashArg, query: &Query) -> PageData {
         count: 12,
         ..Default::default()
     };
+    if matches!(route, StashArg::Scenes | StashArg::Search) {
+        data.scenes = scenes.clone();
+    }
     match route {
         StashArg::Home => {
             data.scenes = scenes.iter().take(12).cloned().collect();
@@ -290,6 +385,15 @@ fn fixture(route: &StashArg, query: &Query) -> PageData {
             false,
         )),
         StashArg::Performer(_) | StashArg::Tag(_) => {
+            if let StashArg::Performer(id) = route {
+                data.reference_date = Some((2026, 10, 1));
+                data.performer = performers.iter().find(|p| &p.id == id).cloned();
+                if let Some(p) = &mut data.performer {
+                    p.tags = tags.iter().take(2).cloned().collect();
+                }
+                data.lazy_tags = tags.clone();
+            }
+            data.scenes = scenes.clone();
             data.sections.push(section(
                 "Scenes",
                 scenes.into_iter().map(scene).collect(),
@@ -393,6 +497,17 @@ fn fixture(route: &StashArg, query: &Query) -> PageData {
                 .take(query.per_page as usize)
                 .collect();
         }
+        if matches!(
+            route,
+            StashArg::Scenes | StashArg::Search | StashArg::Performer(_) | StashArg::Tag(_)
+        ) {
+            data.scenes = data
+                .scenes
+                .into_iter()
+                .skip(offset)
+                .take(query.per_page as usize)
+                .collect();
+        }
     }
 
     data
@@ -454,6 +569,13 @@ fn section(title: &str, tiles: Vec<Tile>, portrait: bool) -> Section {
         title: title.into(),
         tiles,
         portrait,
+        shelf: false,
+    }
+}
+fn shelf(title: &str, tiles: Vec<Tile>) -> Section {
+    Section {
+        shelf: true,
+        ..section(title, tiles, false)
     }
 }
 fn err<E: std::fmt::Display>(e: E) -> String {
@@ -500,30 +622,10 @@ fn load(c: &Client, r: &StashArg, q: &Query) -> Result<PageData, String> {
             if q.page > 1 {
                 return Ok(out);
             }
-            let mut tags = c
-                .tags(
-                    &Query {
-                        per_page: 100,
-                        sort: "name".into(),
-                        ..Default::default()
-                    },
-                    Some(true),
-                )
-                .map_err(err)?;
-            let mut tag_query = Query {
-                per_page: 100,
-                sort: "name".into(),
-                ..Default::default()
-            };
-            while tags.items.len() < tags.count {
-                tag_query.page = tag_query.page.saturating_add(1);
-                let page = c.tags(&tag_query, Some(true)).map_err(err)?;
-                if page.items.is_empty() {
-                    break;
-                }
-                tags.items.extend(page.items);
+            match favorite_tags(c) {
+                Ok(tags) => out.lazy_tags = tags,
+                Err(error) => out.shelves_error = Some(error),
             }
-            out.lazy_tags = tags.items;
         }
         StashArg::Scenes | StashArg::Search => {
             let page = c.scenes(q).map_err(err)?;
@@ -609,8 +711,17 @@ fn load(c: &Client, r: &StashArg, q: &Query) -> Result<PageData, String> {
         StashArg::Performer(id) | StashArg::Tag(id) => {
             let mut query = q.clone();
             if matches!(r, StashArg::Performer(_)) {
-                out.title = c.performer(id).map_err(err)?.name;
+                let person = c.performer(id).map_err(err)?;
+                out.reference_date = Some(c.reference_date());
+                out.title = person.name.clone();
+                out.performer = Some(person);
                 query.performer_id = Some(id.clone());
+                if q.page == 1 {
+                    match favorite_tags(c) {
+                        Ok(tags) => out.lazy_tags = tags,
+                        Err(error) => out.shelves_error = Some(error),
+                    }
+                }
             } else {
                 out.title = c.tag(id).map_err(err)?.name;
                 query.tag_id = Some(id.clone());
@@ -669,9 +780,46 @@ fn load(c: &Client, r: &StashArg, q: &Query) -> Result<PageData, String> {
     Ok(out)
 }
 
+fn favorite_tags(c: &Client) -> Result<Vec<Tag>, String> {
+    let mut query = Query {
+        per_page: 50,
+        sort: "name".into(),
+        direction: Direction::Ascending,
+        ..Default::default()
+    };
+    let mut tags = Vec::new();
+    loop {
+        let page = c.tags(&query, Some(true)).map_err(err)?;
+        let count = page.count;
+        if page.items.is_empty() {
+            break;
+        }
+        tags.extend(page.items);
+        if tags.len() >= count {
+            break;
+        }
+        query.page = query.page.saturating_add(1);
+    }
+    tags.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    tags.dedup_by(|a, b| a.id == b.id);
+    Ok(tags)
+}
+
 #[cfg(test)]
 mod pagination_tests {
     use super::*;
+    #[test]
+    fn reference_date_is_a_replayable_worker_fact() {
+        assert_eq!(
+            fixture(&StashArg::Performer("1".into()), &Query::default()).reference_date,
+            Some((2026, 10, 1))
+        );
+    }
     #[test]
     fn page_boundary_and_last_partial_page_are_terminal() {
         let query = Query {

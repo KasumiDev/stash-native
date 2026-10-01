@@ -68,7 +68,14 @@ fn fixture_playback(route: &str) -> Option<PlaybackView> {
     Some(PlaybackView {
         scene: Some(crate::stash::Scene {
             id: "1".into(),
-            title: Some("Scene 1".into()),
+            title: Some("Scene 1 — a deliberately long title that must stay clear of subtitle, audio, and O count controls".into()),
+            scene_markers: (0..8).map(|index| crate::stash::SceneMarker {
+                id: format!("fixture-marker-{index}"),
+                title: format!("Marker {}", index + 1),
+                seconds: index as f64 * 120.,
+                screenshot: Some(format!("fixture://marker/{index}")),
+                ..Default::default()
+            }).collect(),
             ..Default::default()
         }),
         position: 120.,
@@ -138,13 +145,15 @@ impl Rig<StashHost> for StashRig {
         match fx {
             StashFx::Work(addr, work) => self.work.push((addr, work)),
             StashFx::Media(images, preview) => {
+                self.media.set_cache_account(&self.config);
                 let client = crate::stash::Client::new(self.config.clone()).ok();
                 let mut keys = Vec::new();
                 for (key, url) in images {
                     if cfg!(feature = "hostsim") && url.starts_with("fixture://") {
                         if !self.textures.contains_key(&key) {
                             let tex = fixture_texture(&key, 0, 0);
-                            self.textures.insert(key.clone(), (tex, 96., 144.));
+                            let (w, h) = fixture_dimensions(&key);
+                            self.textures.insert(key.clone(), (tex, w as f32, h as f32));
                         }
                         keys.push(key);
                         continue;
@@ -236,17 +245,24 @@ fn fixture_texture(key: &str, phase: u32, old: u32) -> u32 {
         crate::ui::theme::CONTROL_IDLE_FILL,
     ];
     let seed = key.bytes().fold(0usize, |sum, b| sum + b as usize);
-    let mut pixels = vec![0u8; 96 * 144 * 4];
-    for y in 0..144 {
-        for x in 0..96 {
+    let (w, h) = fixture_dimensions(key);
+    let mut pixels = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
             let color = colors[((x / 24 + y / 24) + seed + phase as usize) % colors.len()];
-            let p = (y * 96 + x) * 4;
+            let p = (y * w + x) * 4;
             for c in 0..4 {
                 pixels[p + c] = (color[c] * 255.) as u8;
             }
         }
     }
-    crate::gfx::upload_rgba(old, 96, 144, pixels.as_ptr())
+    crate::gfx::upload_rgba(old, w as i32, h as i32, pixels.as_ptr())
+}
+fn fixture_dimensions(key: &str) -> (usize, usize) {
+    if key.contains("performer:") { (96, 144) }
+    else if key.starts_with("scene:") && key.rsplit(':').next().and_then(|id| id.parse::<usize>().ok()).is_some_and(|id| id % 3 == 0) { (90, 160) }
+    else if key.starts_with("tag:") { (128, 128) }
+    else { (160, 90) }
 }
 fn scene_boot_route(route: &str) -> Option<StashArg> {
     route
@@ -534,6 +550,10 @@ unsafe fn run_inner() -> c_int {
         let results = rig.worker.poll();
         for (_, msg) in &results {
             if let StashMsg::Connected(Ok(config)) = msg {
+                rig.media.set_cache_account(config);
+                for (_, (texture, _, _)) in rig.textures.drain() {
+                    crate::gfx::delete_tex(texture);
+                }
                 rig.config = config.clone();
             }
         }
@@ -829,7 +849,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             initial_screen.test_focus_identity(initial_focus.elem),
-            Some("control:refresh")
+            Some("control:sort")
         );
         let pending = register_work(&mut dispatcher, &mut rig.work);
         let (addr, work) = pending.into_iter().next().unwrap();
@@ -843,6 +863,7 @@ mod tests {
             sections: vec![crate::stores::stash::Section {
                 title: "Scenes".into(),
                 portrait: false,
+                shelf: false,
                 tiles: (0..12)
                     .map(|i| crate::stores::stash::Tile {
                         identity: format!("scene:fixture{i}"),
@@ -888,7 +909,7 @@ mod tests {
         assert_eq!(dispatcher.focus(), Some(initial_focus));
         assert_eq!(
             stash.test_focus_identity(initial_focus.elem),
-            Some("control:refresh")
+            Some("control:sort")
         );
         // Use the actual catalog's geometry and the same double-buffered map as a presented
         // frame. No injected semantic activation bypasses SDL's button-up ingress.

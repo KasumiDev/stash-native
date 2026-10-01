@@ -31,6 +31,9 @@ struct State {
     append: bool,
     media_at: u32,
     covered: bool,
+    search_dirty_at: Option<u32>,
+    refresh_pages: u32,
+    loaded_pages: u32,
 }
 impl LogicalState for State {
     fn write(&self, c: &mut Canon) {
@@ -43,7 +46,12 @@ impl LogicalState for State {
             .f32(self.scroll)
             .u32(self.editing as u32)
             .u32(self.caret as u32)
-            .bool(self.covered);
+            .bool(self.covered)
+            .u32(self.refresh_pages)
+            .u32(self.loaded_pages);
+        c.option(self.search_dirty_at, |c, at| {
+            c.u32(at);
+        });
     }
     fn probe(&self, s: &mut String) {
         s.push_str(&format!("page={} loading={}", self.page, self.loading));
@@ -56,11 +64,11 @@ struct Row {
     motion: CardRow,
     style: RowStyle,
     y: f32,
+    collection: bool,
+    ordinal: usize,
 }
-const TITLE_Y: f32 = GRID_TOP_Y - TITLE_DY;
-const TITLE_H: f32 = TITLE_DY + theme::space::MD;
-const CONTROLS_Y: f32 = TITLE_Y + TITLE_H + theme::space::SM;
-const CONTENT_TOP: f32 = CONTROLS_Y + theme::space::XL + theme::space::MD;
+const CONTROLS_Y: f32 = GRID_TOP_Y - TITLE_DY;
+const CONTENT_TOP: f32 = CONTROLS_Y + 64. + theme::space::XL + theme::space::MD;
 const CONTENT_VIEW: Rect = Rect::new(0., CONTENT_TOP, SCR_W, SCR_H - CONTENT_TOP);
 pub struct StashScreen {
     route: StashArg,
@@ -74,6 +82,10 @@ pub struct StashScreen {
     detail_inset: Option<f32>,
     scroll_motion: crate::ui::Spring,
     scroll_target: f32,
+    bands: crate::ui::poster_grid::GridBands,
+    media_images: Vec<(String, String)>,
+    media_preview: Option<(String, String)>,
+    refresh_data: Option<PageData>,
 }
 impl StashScreen {
     fn pinned(row: &Row) -> bool {
@@ -85,7 +97,8 @@ impl StashScreen {
         if Self::pinned(row) {
             row.y
         } else {
-            row.y - self.state.scroll
+            row.y + crate::ui::poster_grid::growth_before(row.ordinal, &self.bands.geometry())
+                - self.state.scroll
         }
     }
     #[cfg(test)]
@@ -125,6 +138,10 @@ impl StashScreen {
             detail_inset: None,
             scroll_motion: crate::ui::Spring::at(0.),
             scroll_target: 0.,
+            bands: crate::ui::poster_grid::GridBands::new(),
+            media_images: Vec::new(),
+            media_preview: None,
+            refresh_data: None,
         }
     }
     pub(crate) fn home(entry: EntryId) -> Self {
@@ -132,14 +149,25 @@ impl StashScreen {
         screen.home_shelves = true;
         screen
     }
+    pub(crate) fn performer(&self) -> Option<&crate::stash::Performer> {
+        self.data.performer.as_ref()
+    }
+    pub(crate) fn reference_date(&self) -> Option<(i32, u32, u32)> {
+        self.data.reference_date
+    }
+    pub(crate) fn media_override(
+        &mut self,
+        images: Vec<(String, String)>,
+        preview: Option<(String, String)>,
+    ) {
+        self.media_images = images;
+        self.media_preview = preview;
+    }
     pub(crate) fn scenes(&self) -> &[crate::stash::Scene] {
         &self.data.scenes
     }
     pub(crate) fn loading(&self) -> bool {
         self.state.loading
-    }
-    pub(crate) fn error(&self) -> &str {
-        &self.state.error
     }
     pub(crate) fn retry(&mut self, fx: &mut Effects<'_, StashHost>) {
         if !self.state.loading {
@@ -159,6 +187,8 @@ impl StashScreen {
         if self.home_shelves {
             let top = GRID_TOP_Y - TITLE_DY - theme::space::MD;
             Rect::new(0., top, SCR_W, SCR_H - top)
+        } else if matches!(self.route, StashArg::Search) {
+            Rect::new(0., 300., SCR_W, SCR_H - 300.)
         } else {
             CONTENT_VIEW
         }
@@ -207,6 +237,12 @@ impl StashScreen {
         self.state.loading = true;
         self.state.shelf_loading = false;
         self.state.error.clear();
+        if matches!(self.route, StashArg::Search) && self.state.query.trim().is_empty() {
+            self.state.loading = false;
+            self.data = PageData::default();
+            self.rebuild();
+            return;
+        }
         let query = self.query();
         fx.push(Fx::App(StashFx::Work(
             Addr {
@@ -225,35 +261,54 @@ impl StashScreen {
     /// duplicate-only page from a server whose count changed during browsing.
     fn land_page(&mut self, data: &PageData) {
         if !self.state.append {
-            self.data = data.clone();
-            return;
-        }
-        let mut added = 0;
-        for section in &data.sections {
-            if let Some(existing) = self
+            let retained = self
                 .data
                 .sections
-                .iter_mut()
-                .find(|s| s.title == section.title)
-            {
-                for tile in &section.tiles {
-                    if !existing.tiles.iter().any(|t| t.identity == tile.identity) {
-                        existing.tiles.push(tile.clone());
-                        added += 1;
-                    }
-                }
+                .iter()
+                .filter(|section| {
+                    section.shelf && data.lazy_tags.iter().any(|tag| tag.name == section.title)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            self.data = data.clone();
+            if matches!(self.route, StashArg::Performer(_)) {
+                self.data.sections.splice(0..0, retained);
             } else {
-                added += section.tiles.len();
-                self.data.sections.push(section.clone());
+                self.data.sections.extend(retained);
             }
+            return;
         }
-        for image in &data.images {
-            if !self.data.images.iter().any(|i| i.id == image.id) {
-                self.data.images.push(image.clone());
-            }
+        append_page(&mut self.data, data);
+    }
+    fn refresh(&mut self, fx: &mut Effects<'_, StashHost>) {
+        self.state.refresh_pages = self.state.loaded_pages.max(1);
+        self.refresh_data = Some(PageData::default());
+        self.state.page = 1;
+        self.state.append = false;
+        self.load(fx);
+    }
+    fn cancel_refresh(&mut self) {
+        self.refresh_data = None;
+        self.state.refresh_pages = 0;
+    }
+    fn land_refresh(&mut self, data: &PageData, fx: &mut Effects<'_, StashHost>) -> bool {
+        let Some(pending) = self.refresh_data.as_mut() else {
+            return true;
+        };
+        if self.state.page == 1 {
+            *pending = data.clone();
+        } else {
+            append_page(pending, data);
         }
-        self.data.count = data.count;
-        self.data.has_more = data.has_more && added > 0;
+        if self.state.page < self.state.refresh_pages && data.has_more {
+            self.state.page += 1;
+            self.load(fx);
+            return false;
+        }
+        let pending = self.refresh_data.take().unwrap();
+        self.state.refresh_pages = 0;
+        self.land_page(&pending);
+        true
     }
     fn near_page_end(&self, focused: Option<u32>) -> bool {
         self.data
@@ -332,9 +387,17 @@ impl StashScreen {
                 to: fx.from(),
                 req: RequestId(self.state.generation),
             },
-            Work::TagShelf {
-                tag,
-                generation: self.state.generation,
+            if let StashArg::Performer(id) = &self.route {
+                Work::PerformerTagShelf {
+                    performer_id: id.clone(),
+                    tag,
+                    generation: self.state.generation,
+                }
+            } else {
+                Work::TagShelf {
+                    tag,
+                    generation: self.state.generation,
+                }
             },
         )));
     }
@@ -350,47 +413,38 @@ impl StashScreen {
     }
     fn rebuild(&mut self) {
         let mut sections = Vec::new();
-        let mut controls = vec![Self::control(
-            "refresh",
-            if self.state.loading {
-                "Loading…"
-            } else if !self.state.error.is_empty() {
-                "Retry"
-            } else {
-                "Refresh"
-            }
-            .into(),
-            Action::Refresh,
-        )];
-        if !self.home_shelves && self.detail_inset.is_none() {
-            controls.push(Self::control(
-                "search",
-                format!("Search: {}", self.state.query),
-                Action::EditSearch,
-            ));
-            if matches!(self.route, StashArg::Scenes | StashArg::Search) {
-                controls.push(Self::control(
-                    "sort",
-                    format!(
-                        "Sort: {}",
-                        ["Date", "Title", "O count"][self.state.sort % 3]
-                    ),
-                    Action::Sort,
-                ));
-            }
+        let mut controls = Vec::new();
+        if matches!(self.route, StashArg::Search) {
+            sections.push(Section {
+                title: String::new(),
+                tiles: vec![Self::control(
+                    "search",
+                    self.state.query.clone(),
+                    Action::EditSearch,
+                )],
+                portrait: false,
+                shelf: false,
+            });
         }
-        if !self.home_shelves
-            && (self.detail_inset.is_none()
-                || self.data.scene.is_none()
-                || !self.state.error.is_empty())
-        {
-            if self.detail_inset.is_some() {
-                controls.truncate(1);
-            }
+        if !self.state.error.is_empty() {
+            controls.push(Self::control("retry", "Retry".into(), Action::Refresh));
+        }
+        if matches!(self.route, StashArg::Scenes) {
+            controls.push(Self::control(
+                "sort",
+                format!(
+                    "Sort: {}",
+                    ["Date", "Title", "O count"][self.state.sort % 3]
+                ),
+                Action::Sort,
+            ));
+        }
+        if !self.home_shelves && !controls.is_empty() {
             sections.push(Section {
                 title: String::new(),
                 tiles: controls,
                 portrait: false,
+                shelf: false,
             });
         }
         sections.extend(
@@ -405,51 +459,74 @@ impl StashScreen {
                 .map(|(_, s)| s.clone()),
         );
         let mut old_motion = std::mem::take(&mut self.rows).into_iter();
-        let mut y = if self.detail_inset.is_some() && self.data.scene.is_none() {
+        let mut y = if self.detail_inset.is_some()
+            && self.data.scene.is_none()
+            && self.data.performer.is_none()
+        {
             CONTROLS_Y
         } else if let Some(inset) = self.detail_inset {
             inset
         } else if self.home_shelves {
             PEEK_Y
-        } else {
+        } else if sections.first().is_some_and(control_section) {
             CONTROLS_Y
+        } else {
+            CONTENT_TOP - CARD_DY
         };
+        if matches!(self.route, StashArg::Search) {
+            y = 300. - CARD_DY;
+        }
         for (section_index, s) in sections.into_iter().enumerate() {
+            let collection =
+                !control_section(&s) && !matches!(self.route, StashArg::Home) && !s.shelf;
             let control = s
                 .tiles
                 .first()
                 .is_some_and(|t| t.identity.starts_with("control:"));
+            let (columns, collection_style) = crate::ui::poster_grid::collection_style(
+                s.portrait,
+                matches!(self.route, StashArg::Tags),
+            );
             let style = if control {
                 RowStyle {
-                    w: if section_index == 0 { 225. } else { 405. },
-                    h: 64.,
+                    w: if matches!(self.route, StashArg::Search) && section_index == 0 {
+                        crate::ui::search_field::FIELD.w
+                    } else {
+                        225.
+                    },
+                    h: if matches!(self.route, StashArg::Search) {
+                        80.
+                    } else {
+                        64.
+                    },
                     gap: 20.,
                     margin_x: MARGIN_X,
+                    focus_scale: if matches!(self.route, StashArg::Search) && section_index == 0 {
+                        1.
+                    } else {
+                        RowStyle::EPISODE.focus_scale
+                    },
                     ..RowStyle::EPISODE
                 }
-            } else if matches!(self.route, StashArg::Tags) {
-                RowStyle {
-                    w: SCR_W - 2. * MARGIN_X,
-                    h: 72.,
-                    gap: 0.,
-                    margin_x: MARGIN_X,
-                    focus_scale: 1.02,
-                    ..RowStyle::EPISODE
-                }
+            } else if collection {
+                collection_style
             } else if s.portrait {
                 RowStyle::HOME
             } else {
                 RowStyle::EPISODE
             };
-            let chunk = if matches!(self.route, StashArg::Home) || control {
+            let chunk = if !collection {
                 s.tiles.len().max(1)
-            } else if matches!(self.route, StashArg::Tags) {
-                1
-            } else if s.portrait {
-                crate::ui::poster_grid::COLS
             } else {
-                4
+                columns
             };
+            if matches!(self.route, StashArg::Search) && control {
+                y = if section_index == 0 {
+                    crate::ui::search_field::FIELD.y
+                } else {
+                    230.
+                };
+            }
             for (i, tiles) in s.tiles.chunks(chunk).enumerate() {
                 if !control {
                     y += if i == 0 {
@@ -458,8 +535,6 @@ impl StashScreen {
                         } else {
                             TITLE_DY + CARD_DY
                         }
-                    } else if matches!(self.route, StashArg::Tags) {
-                        theme::space::SM
                     } else {
                         theme::space::MD
                     };
@@ -470,7 +545,16 @@ impl StashScreen {
                         let identity = if control {
                             t.identity.clone()
                         } else {
-                            format!("{}:{}", s.title, t.identity)
+                            format!(
+                                "{}{}:{}",
+                                if s.shelf && !matches!(self.route, StashArg::Home) {
+                                    "shelf:"
+                                } else {
+                                    ""
+                                },
+                                s.title,
+                                t.identity
+                            )
                         };
                         let key = self.keys.entry(identity).or_insert_with(|| {
                             let k = self.next_key;
@@ -494,15 +578,20 @@ impl StashScreen {
                         .unwrap_or_else(CardRow::new),
                     style,
                     y,
+                    collection,
+                    ordinal: self.rows.len(),
                 });
                 y += style.h
                     + if control {
                         theme::space::MD
-                    } else if matches!(self.route, StashArg::Tags) {
-                        theme::space::SM
+                    } else if collection {
+                        card_row::LABEL_BAND_COLLAPSED + crate::ui::consts::UNDER_LABEL_AIR
                     } else {
-                        TileLabel::height(true)
+                        TileLabel::height(true) + theme::space::XL
                     };
+            }
+            if control {
+                y = self.content_view().y - CARD_DY;
             }
         }
     }
@@ -581,9 +670,6 @@ impl StashScreen {
             if self.row_y(row) > 1080. || self.row_y(row) + row.style.h < CONTENT_VIEW.y {
                 continue;
             }
-            if matches!(self.route, StashArg::Tags) {
-                continue;
-            }
             for (index, tile) in row.tiles.iter().enumerate() {
                 let Some(placed) = self.place(&row.keys[index], cx, At::Drawn) else {
                     continue;
@@ -596,16 +682,18 @@ impl StashScreen {
                 }
             }
         }
-        let preview = cx
-            .focus
-            .current
-            .and_then(|k| self.position(k.elem))
-            .and_then(|(r, c)| self.rows[r].tiles.get(c))
-            .and_then(|t| {
-                t.preview
-                    .as_ref()
-                    .map(|url| (t.identity.clone(), url.clone()))
-            });
+        images.extend(self.media_images.iter().cloned());
+        let preview = self.media_preview.clone().or_else(|| {
+            cx.focus
+                .current
+                .and_then(|k| self.position(k.elem))
+                .and_then(|(r, c)| self.rows[r].tiles.get(c))
+                .and_then(|t| {
+                    t.preview
+                        .as_ref()
+                        .map(|url| (t.identity.clone(), url.clone()))
+                })
+        });
         fx.push(Fx::App(StashFx::Media(images, preview)));
     }
     fn activate(&mut self, key: u32, cx: &Cx<'_, StashHost>, fx: &mut Effects<'_, StashHost>) {
@@ -640,12 +728,14 @@ impl StashScreen {
                 if self.state.loading {
                     return;
                 }
-                if !self.state.append {
-                    self.state.page = 1;
+                if self.refresh_data.is_some() || self.state.append {
+                    self.load(fx);
+                } else {
+                    self.refresh(fx);
                 }
-                self.load(fx);
             }
             Action::Sort => {
+                self.cancel_refresh();
                 self.state.sort = (self.state.sort + 1) % 3;
                 self.state.page = 1;
                 self.state.append = false;
@@ -736,14 +826,27 @@ impl Machine<StashHost> for StashScreen {
             ScreenEvent::Mount => {
                 self.rebuild();
                 self.load(fx);
+                if matches!(self.route, StashArg::Search) {
+                    self.state.editing = 1;
+                    fx.push(Fx::App(StashFx::Keyboard(true)));
+                    if let Some(key) = self.keys.get("control:search") {
+                        fx.push(Fx::Deliver(
+                            fx.from(),
+                            Delivery::Screen(ScreenEvent::Enter(Enter::Fresh {
+                                focus: FocusTarget::Elem(FocusKey {
+                                    entry: self.entry,
+                                    elem: *key,
+                                }),
+                            })),
+                        ));
+                    }
+                }
                 Handled::Yes
             }
             ScreenEvent::Uncover => {
                 self.state.covered = false;
                 if !self.state.loading {
-                    self.state.page = 1;
-                    self.state.append = false;
-                    self.load(fx);
+                    self.refresh(fx);
                 }
                 Handled::Yes
             }
@@ -753,9 +856,32 @@ impl Machine<StashHost> for StashScreen {
                 self.state.loading = false;
                 match result {
                     Ok(data) => {
-                        self.land_page(data);
+                        let old_focus = cx.focus.current.and_then(|key| {
+                            self.position(key.elem)
+                                .map(|(row, _)| (key.elem, self.rows[row].y))
+                        });
+                        if self.refresh_data.is_some() {
+                            if !self.land_refresh(data, fx) {
+                                fx.invalidate(crate::ui::present::Provenance::Landing(fx.from()));
+                                return Handled::Yes;
+                            }
+                        } else {
+                            self.land_page(data);
+                        }
+                        self.state.loaded_pages = self.state.page;
+                        if let Some(error) = &self.data.shelves_error {
+                            self.state.error = error.clone();
+                        }
                         self.state.append = false;
                         self.rebuild();
+                        if let Some((key, old_y)) = old_focus {
+                            if let Some((row, _)) = self.position(key) {
+                                let shift = self.rows[row].y - old_y;
+                                self.state.scroll += shift;
+                                self.scroll_target += shift;
+                                self.scroll_motion.pos += shift;
+                            }
+                        }
                         self.media(cx, fx);
                         self.next_shelf(fx);
                     }
@@ -771,11 +897,54 @@ impl Machine<StashHost> for StashScreen {
                 if *generation == self.state.generation =>
             {
                 self.state.shelf_loading = false;
+                let old_focus = cx
+                    .focus
+                    .current
+                    .and_then(|k| self.position(k.elem).map(|(r, _)| (k.elem, self.rows[r].y)));
                 match result {
                     Ok(section) => {
                         if !section.tiles.is_empty() {
-                            self.data.sections.push(section.clone());
+                            if let Some(existing) = self.data.sections.iter_mut().find(|old| {
+                                old.title == section.title && old.shelf == section.shelf
+                            }) {
+                                *existing = section.clone();
+                            } else if matches!(self.route, StashArg::Performer(_)) {
+                                let at = self
+                                    .data
+                                    .sections
+                                    .iter()
+                                    .position(|section| !section.shelf)
+                                    .unwrap_or(self.data.sections.len());
+                                self.data.sections.insert(at, section.clone());
+                            } else {
+                                self.data.sections.push(section.clone());
+                            }
+                            if matches!(self.route, StashArg::Performer(_)) {
+                                self.data.sections.sort_by(|a, b| {
+                                    b.shelf.cmp(&a.shelf).then_with(|| {
+                                        if a.shelf && b.shelf {
+                                            a.title.to_lowercase().cmp(&b.title.to_lowercase())
+                                        } else {
+                                            std::cmp::Ordering::Equal
+                                        }
+                                    })
+                                });
+                            } else if matches!(self.route, StashArg::Home)
+                                && self.data.sections.len() > 2
+                            {
+                                self.data.sections[2..].sort_by(|a, b| {
+                                    a.title.to_lowercase().cmp(&b.title.to_lowercase())
+                                });
+                            }
                             self.rebuild();
+                            if let Some((key, old_y)) = old_focus {
+                                if let Some((r, _)) = self.position(key) {
+                                    let shift = self.rows[r].y - old_y;
+                                    self.state.scroll += shift;
+                                    self.scroll_target += shift;
+                                    self.scroll_motion.pos += shift;
+                                }
+                            }
                             self.media(cx, fx);
                         } else {
                             self.next_shelf(fx);
@@ -805,6 +974,13 @@ impl Machine<StashHost> for StashScreen {
                 Handled::Yes
             }
             ScreenEvent::FocusMoved { to, .. } => {
+                if matches!(self.route, StashArg::Search)
+                    && self.state.editing != 0
+                    && self.keys.get("control:search") != Some(&to.elem)
+                {
+                    self.state.editing = 0;
+                    fx.push(Fx::App(StashFx::Keyboard(false)));
+                }
                 if let Some((r, _)) = self.position(to.elem) {
                     let row = &self.rows[r];
                     if !Self::pinned(row) && !self.home_shelves {
@@ -812,12 +988,20 @@ impl Machine<StashHost> for StashScreen {
                             .rows
                             .last()
                             .map_or(0., |last| {
-                                last.y + last.style.h + TileLabel::height(true) - SCR_H
+                                last.y
+                                    + crate::ui::poster_grid::growth_before(
+                                        last.ordinal,
+                                        &crate::ui::poster_grid::settled(Some(r)),
+                                    )
+                                    + last.style.h
+                                    + TileLabel::height(true)
+                                    - (SCR_H - crate::ui::consts::MARGIN_Y)
                             })
                             .max(0.);
                         self.scroll_target = card_row::reveal(
                             self.state.scroll,
-                            row.y + row.style.h + TileLabel::height(true) - SCR_H,
+                            row.y + row.style.h + TileLabel::height(true)
+                                - (SCR_H - crate::ui::consts::MARGIN_Y),
                             row.y - self.content_view().y - card_row::heading_lift_max(&row.style),
                             max,
                         );
@@ -844,6 +1028,10 @@ impl Machine<StashHost> for StashScreen {
                 buffer.edit(edit);
                 self.state.caret = buffer.caret();
                 *value = buffer.into_text();
+                self.state.generation = self.state.generation.wrapping_add(1);
+                self.state.loading = false;
+                self.state.search_dirty_at = Some(cx.tick.ms);
+                self.cancel_refresh();
                 self.rebuild();
                 fx.invalidate(crate::ui::present::Provenance::Input);
                 Handled::Yes
@@ -888,6 +1076,7 @@ impl Machine<StashHost> for StashScreen {
                 self.state.editing = 0;
                 fx.push(Fx::App(StashFx::Keyboard(false)));
                 if search {
+                    self.state.search_dirty_at = None;
                     self.state.page = 1;
                     self.state.append = false;
                     self.load(fx);
@@ -895,6 +1084,23 @@ impl Machine<StashHost> for StashScreen {
                 Handled::Yes
             }
             ScreenEvent::Tick(t) => {
+                if self
+                    .state
+                    .search_dirty_at
+                    .is_some_and(|at| t.ms.wrapping_sub(at) >= 300)
+                {
+                    self.state.search_dirty_at = None;
+                    self.state.page = 1;
+                    self.state.append = false;
+                    self.load(fx);
+                }
+                let focused_row = cx
+                    .focus
+                    .current
+                    .and_then(|k| self.position(k.elem))
+                    .and_then(|(r, _)| self.rows[r].collection.then_some(r));
+                self.bands.focus(focused_row, true);
+                self.bands.tick(crate::ui::consts::K_SCROLL, t.dt());
                 if !self.home_shelves {
                     self.scroll_motion.step(
                         self.scroll_target,
@@ -921,20 +1127,60 @@ impl Machine<StashHost> for StashScreen {
             }
             ScreenEvent::WillLeave(_) | ScreenEvent::Cover | ScreenEvent::Unmount => {
                 self.state.covered = true;
+                if self.state.editing != 0 {
+                    self.state.editing = 0;
+                    fx.push(Fx::App(StashFx::Keyboard(false)));
+                }
                 fx.push(Fx::App(StashFx::Media(Vec::new(), None)));
                 Handled::Yes
             }
             ScreenEvent::StoreChanged(STASH_ACTIVITY, _)
                 if !self.state.covered && !self.state.loading =>
             {
-                self.state.page = 1;
-                self.state.append = false;
-                self.load(fx);
+                self.refresh(fx);
                 Handled::Yes
             }
             _ => Handled::No,
         }
     }
+}
+fn append_page(page: &mut PageData, data: &PageData) {
+    let mut added = 0;
+    for section in &data.sections {
+        if let Some(existing) = page
+            .sections
+            .iter_mut()
+            .find(|s| s.title == section.title && s.shelf == section.shelf)
+        {
+            for tile in &section.tiles {
+                if !existing.tiles.iter().any(|t| t.identity == tile.identity) {
+                    existing.tiles.push(tile.clone());
+                    added += 1;
+                }
+            }
+        } else {
+            added += section.tiles.len();
+            page.sections.push(section.clone());
+        }
+    }
+    for image in &data.images {
+        if !page.images.iter().any(|i| i.id == image.id) {
+            page.images.push(image.clone());
+        }
+    }
+    page.count = data.count;
+    page.has_more = data.has_more && added > 0;
+    for scene in &data.scenes {
+        if !page.scenes.iter().any(|existing| existing.id == scene.id) {
+            page.scenes.push(scene.clone());
+        }
+    }
+}
+fn control_section(section: &Section) -> bool {
+    section
+        .tiles
+        .first()
+        .is_some_and(|t| t.identity.starts_with("control:"))
 }
 fn label(p: Painter, text: &str, rect: Rect, size: i32, color: [f32; 4]) {
     let text = std::ffi::CString::new(text.replace('\0', "")).unwrap();
@@ -987,20 +1233,6 @@ impl Screen<StashHost> for StashScreen {
     }
     fn draw(&mut self, f: &mut DrawFrame<'_, '_, StashHost>) {
         let p = f.painter;
-        let title = if self.data.title.is_empty() {
-            self.route.label()
-        } else {
-            &self.data.title
-        };
-        if !self.home_shelves && self.detail_inset.is_none() {
-            label(
-                p,
-                title,
-                Rect::new(MARGIN_X, TITLE_Y, SCR_W - 2. * MARGIN_X, TITLE_H),
-                theme::size::TITLE,
-                theme::TEXT_PRIMARY,
-            );
-        }
         for row in &self.rows {
             let y = self.row_y(row);
             if y > 1080.
@@ -1034,8 +1266,8 @@ impl Screen<StashHost> for StashScreen {
                     f.cx.measure,
                 );
             }
-            let buttons = Self::pinned(row) || matches!(self.route, StashArg::Tags);
-            if !buttons {
+            let buttons = Self::pinned(row);
+            if !buttons && !row.collection {
                 let focused =
                     f.cx.focus
                         .current
@@ -1074,7 +1306,16 @@ impl Screen<StashHost> for StashScreen {
                     f.cx.measure,
                 );
             }
-            for (c, tile) in row.tiles.iter().enumerate() {
+            let focused_col =
+                f.cx.focus
+                    .current
+                    .filter(|key| key.entry == self.entry)
+                    .and_then(|key| row.keys.iter().position(|elem| *elem == key.elem));
+            let order = (0..row.tiles.len())
+                .filter(|index| Some(*index) != focused_col)
+                .chain(focused_col);
+            for c in order {
+                let tile = &row.tiles[c];
                 let key = row.keys[c];
                 let Some(placed) = self.place(&key, f.cx, At::Drawn) else {
                     continue;
@@ -1101,7 +1342,85 @@ impl Screen<StashHost> for StashScreen {
                         activate: Activate::Press,
                     },
                 );
-                if tile.identity.starts_with("control:") || matches!(self.route, StashArg::Tags) {
+                if row.collection {
+                    let preview_key = format!("preview:{}", tile.identity);
+                    let image = if focus {
+                        f.cx.views
+                            .textures
+                            .get(&preview_key)
+                            .or_else(|| f.cx.views.textures.get(&tile.identity))
+                    } else {
+                        f.cx.views.textures.get(&tile.identity)
+                    };
+                    let scale = row.motion.scale(c);
+                    let lift =
+                        ((scale - 1.) / (row.style.focus_scale - 1.).max(0.001)).clamp(0., 1.);
+                    if row.style.w > row.style.h {
+                        crate::ui::widgets::contained_card(
+                            p,
+                            rect,
+                            image.copied(),
+                            row.style.tile_radius(rect, scale),
+                            lift,
+                        );
+                    } else {
+                        card_row::draw_tile(
+                            p,
+                            Art::Texture {
+                                key: &tile.identity,
+                                image: image.copied(),
+                                portrait: tile.identity.starts_with("performer:"),
+                            },
+                            rect,
+                            scale,
+                            &row.style,
+                            None,
+                        );
+                    }
+                    if matches!(self.route, StashArg::Tags) && image.is_none() {
+                        let name = crate::text::elide_by(
+                            &tile.title,
+                            rect.w - 2. * theme::space::MD,
+                            false,
+                            |text| f.cx.measure.width_str(text, theme::size::CAPTION, true),
+                        );
+                        let name = std::ffi::CString::new(name.replace('\0', "")).unwrap();
+                        Label::new(name.as_ptr(), theme::size::CAPTION, theme::TEXT_PRIMARY)
+                            .bold()
+                            .h(crate::ui::label::HAlign::Center)
+                            .draw(p, rect);
+                    }
+                    if focus {
+                        let expansion = self
+                            .bands
+                            .geometry()
+                            .iter()
+                            .find(|band| band.row == row.ordinal)
+                            .map_or(0., |band| band.expansion);
+                        let title = TileLabel::titled(&tile.title, &tile.caption)
+                            .revealed(card_row::band_reveal(expansion));
+                        let base_bottom = rect.cy() + rect.h / scale * 0.5;
+                        card_row::draw_label_block(
+                            p,
+                            rect,
+                            &row.style,
+                            &title,
+                            base_bottom + card_row::UNDER_DROP,
+                            f.cx.measure,
+                        );
+                    }
+                } else if tile.identity == "control:search" {
+                    crate::ui::search_field::draw(
+                        p,
+                        rect,
+                        &self.state.query,
+                        self.state.caret,
+                        self.state.editing != 0,
+                        f.cx.tick.ms % 1000 < 500,
+                        f32::from(focus),
+                        f.cx.measure,
+                    );
+                } else if tile.identity.starts_with("control:") {
                     let label = if matches!(self.route, StashArg::Tags) && !tile.caption.is_empty()
                     {
                         format!("{} {}", tile.caption, tile.title)
@@ -1136,7 +1455,9 @@ impl Screen<StashHost> for StashScreen {
                 theme::size::CAPTION,
                 theme::TEXT_SECONDARY,
             );
-        } else if self.data.sections.iter().all(|s| s.tiles.is_empty()) {
+        } else if self.data.sections.iter().all(|s| s.tiles.is_empty())
+            && (!matches!(self.route, StashArg::Search) || !self.state.query.trim().is_empty())
+        {
             label(
                 p,
                 "No results",
@@ -1168,6 +1489,7 @@ mod tests {
                 title: "Scenes".into(),
                 tiles: ids.iter().map(|id| tile(id)).collect(),
                 portrait: false,
+                shelf: false,
             }],
             ..Default::default()
         }
@@ -1194,6 +1516,7 @@ mod tests {
             title: "Performers".into(),
             tiles: vec![person],
             portrait: true,
+            shelf: false,
         });
         screen.rebuild();
         assert_ne!(
@@ -1209,9 +1532,10 @@ mod tests {
             title: "Tag 1".into(),
             tiles: vec![tile("a")],
             portrait: false,
+            shelf: false,
         });
         screen.rebuild();
-        assert_ne!(screen.rows[1].keys[0], screen.rows[2].keys[0]);
+        assert_ne!(screen.rows[0].keys[0], screen.rows[1].keys[0]);
     }
     #[test]
     fn initial_query_is_first_page_and_performer_sort_descending() {
@@ -1242,6 +1566,7 @@ mod tests {
             title: "Performers".into(),
             tiles: vec![tile("b")],
             portrait: true,
+            shelf: false,
         });
         screen.rebuild();
         assert_eq!(screen.rows.len(), 1);
@@ -1267,28 +1592,69 @@ mod tests {
         screen.grid(|grid| assert_eq!(grid.shelves[0].group, GroupId(0)));
     }
     #[test]
-    fn catalog_header_controls_and_grid_clear_shared_top_chrome() {
+    fn catalog_grid_clears_shared_top_chrome_without_redundant_controls() {
         let mut screen = StashScreen::new(StashArg::Performers, EntryId(1));
         screen.data = data(&["a"]);
         screen.data.sections[0].portrait = true;
         screen.rebuild();
+        assert_eq!(screen.rows.len(), 1);
+        assert!(screen.rows[0].collection);
         let chip = crate::ui::widgets::CHIP_FRAME;
-        assert!(TITLE_Y >= chip.y + chip.h + theme::space::SM);
-        assert!(screen.rows[0].y >= TITLE_Y + TITLE_H + theme::space::SM);
-        let card_top =
-            screen.rows[1].y - crate::ui::card_row::heading_lift_max(&screen.rows[1].style);
-        assert!(card_top > screen.rows[0].y + screen.rows[0].style.h + theme::space::MD);
-        assert_eq!(screen.rows[0].style.margin_x, MARGIN_X);
+        assert!(screen.rows[0].y > chip.y + chip.h + theme::space::MD);
+        assert!(screen.rows[0].y >= screen.content_view().y);
+        assert!(screen.rows[0].title.is_empty());
     }
     #[test]
-    fn tags_are_single_item_text_rows() {
+    fn tags_use_square_collection_cells_without_refresh_or_search() {
         let mut screen = StashScreen::new(StashArg::Tags, EntryId(1));
         screen.data = data(&["a", "b"]);
         screen.rebuild();
-        assert_eq!(screen.rows[1].tiles.len(), 1);
+        assert_eq!(screen.rows.len(), 1);
+        assert_eq!(screen.rows[0].tiles.len(), 2);
+        assert_eq!(screen.rows[0].style.w, screen.rows[0].style.h);
+        assert!(screen.rows[0].collection);
+        assert!(!screen
+            .rows
+            .iter()
+            .flat_map(|row| &row.tiles)
+            .any(|tile| tile.identity.starts_with("control:")));
+    }
+    #[test]
+    fn scene_grid_uses_four_uniform_landscape_cells_and_short_final_row() {
+        let mut screen = StashScreen::new(StashArg::Scenes, EntryId(1));
+        screen.data = data(&["a", "b", "c", "d", "e"]);
+        screen.rebuild();
+        assert_eq!(screen.rows[1].tiles.len(), 4);
         assert_eq!(screen.rows[2].tiles.len(), 1);
-        assert_eq!(screen.rows[1].style.h, 72.);
-        assert_eq!(screen.rows[1].style.w, SCR_W - 2. * MARGIN_X);
+        assert!(screen.rows[1].collection);
+        assert!(screen.rows[1].style.w > screen.rows[1].style.h);
+        assert_eq!(screen.rows[0].tiles.len(), 1);
+        assert_eq!(screen.rows[0].tiles[0].identity, "control:sort");
+    }
+    #[test]
+    fn performer_favorite_sections_remain_shelves_above_the_scene_grid() {
+        let mut screen = StashScreen::new(StashArg::Performer("1".into()), EntryId(1));
+        screen.data = data(&["a"]);
+        screen.data.sections.insert(
+            0,
+            Section {
+                title: "Favorite tag".into(),
+                tiles: vec![tile("b")],
+                portrait: false,
+                shelf: true,
+            },
+        );
+        screen.rebuild();
+        assert!(!screen.rows[0].collection);
+        assert!(screen.rows[1].collection);
+    }
+    #[test]
+    fn full_portrait_scene_is_contained_in_landscape_frame() {
+        let frame = Rect::new(0., 0., 420., 236.);
+        let portrait = crate::ui::widgets::contain_frame(frame, 540., 960.);
+        assert_eq!(portrait.h, frame.h);
+        assert!(portrait.w < frame.w);
+        assert_eq!(portrait.cx(), frame.cx());
     }
     fn fifty_scenes() -> PageData {
         let ids = (1..=50).map(|id| id.to_string()).collect::<Vec<_>>();
@@ -1369,6 +1735,121 @@ mod tests {
         fn line_h(&self, _: i32) -> f32 {
             10.
         }
+    }
+    #[test]
+    fn refresh_stages_all_loaded_pages_before_replacing_focused_tail() {
+        let mut screen = StashScreen::new(StashArg::Scenes, EntryId(1));
+        screen.data = fifty_scenes();
+        screen.state.append = true;
+        screen.land_page(&data(&["51", "52"]));
+        screen.rebuild();
+        screen.state.loaded_pages = 2;
+        let key = screen.test_content_key("scene:51").unwrap();
+        let mut out = Vec::new();
+        let mut present = crate::ui::present::Present::new();
+        let mut fx = Effects::new(&mut out, MachineId::Instance(InstanceId(1)), &mut present);
+        screen.refresh(&mut fx);
+        let mut first = fifty_scenes();
+        first.sections[0].tiles[0].title = "Refreshed".into();
+        assert!(!screen.land_refresh(&first, &mut fx));
+        assert_eq!(screen.data.sections[0].tiles[0].title, "1");
+        assert_eq!(screen.test_content_key("scene:51"), Some(key));
+        assert!(screen.land_refresh(&data(&["51", "52"]), &mut fx));
+        screen.rebuild();
+        assert_eq!(screen.data.sections[0].tiles[0].title, "Refreshed");
+        assert_eq!(screen.test_content_key("scene:51"), Some(key));
+        assert_eq!(screen.state.page, 2);
+        assert!(screen.refresh_data.is_none());
+    }
+    #[test]
+    fn search_focuses_field_opens_keyboard_and_debounces_scene_requests() {
+        let _lock = crate::testlock::serial();
+        let config = Config::default();
+        let textures = HashMap::new();
+        let playback = PlaybackView::default();
+        let cx = Cx {
+            views: Views {
+                textures: &textures,
+                config: &config,
+                playback: &playback,
+            },
+            tick: Tick::default(),
+            measure: &Measure,
+            press: PressRead::default(),
+            focus: FocusRead::default(),
+            owner: InputOwner::Entry(EntryId(1)),
+        };
+        let mut screen = StashScreen::new(StashArg::Search, EntryId(1));
+        let mut out = Vec::new();
+        let mut present = crate::ui::present::Present::new();
+        {
+            let mut fx = Effects::new(&mut out, MachineId::Instance(InstanceId(1)), &mut present);
+            screen.step(&ScreenEvent::Mount, &cx, &mut fx);
+        }
+        assert_eq!(
+            out.iter()
+                .filter(|event| matches!(event.fx, Fx::App(StashFx::Keyboard(true))))
+                .count(),
+            1
+        );
+        assert!(out.iter().any(|event| matches!(&event.fx, Fx::Deliver(_, Delivery::Screen(ScreenEvent::Enter(Enter::Fresh { focus: FocusTarget::Elem(key) }))) if key.elem == screen.keys["control:search"])));
+        out.clear();
+        let old_generation = screen.state.generation;
+        {
+            let mut fx = Effects::new(&mut out, MachineId::Instance(InstanceId(1)), &mut present);
+            screen.step(
+                &ScreenEvent::Input(InputEvent {
+                    at: Tick::default(),
+                    source: Source::Script,
+                    kind: InputKind::Text(TextEdit::Commit("cats".into())),
+                }),
+                &cx,
+                &mut fx,
+            );
+            screen.step(
+                &ScreenEvent::Tick(Tick {
+                    ms: 299,
+                    dt_us: 16000,
+                }),
+                &cx,
+                &mut fx,
+            );
+            screen.step(
+                &ScreenEvent::Async(
+                    RequestId(old_generation),
+                    StashMsg::Loaded {
+                        generation: old_generation,
+                        result: Ok(data(&["stale"])),
+                    },
+                ),
+                &cx,
+                &mut fx,
+            );
+        }
+        assert!(!out
+            .iter()
+            .any(|event| matches!(event.fx, Fx::App(StashFx::Work(_, Work::Load { .. })))));
+        assert!(screen.data.sections.is_empty());
+        {
+            let mut fx = Effects::new(&mut out, MachineId::Instance(InstanceId(1)), &mut present);
+            screen.step(
+                &ScreenEvent::Tick(Tick {
+                    ms: 300,
+                    dt_us: 16000,
+                }),
+                &cx,
+                &mut fx,
+            );
+            screen.step(
+                &ScreenEvent::Tick(Tick {
+                    ms: 600,
+                    dt_us: 16000,
+                }),
+                &cx,
+                &mut fx,
+            );
+        }
+        assert_eq!(out.iter().filter(|event| matches!(&event.fx, Fx::App(StashFx::Work(_, Work::Load { route: StashArg::Search, query, .. })) if query.q == "cats")).count(), 1);
     }
     #[test]
     fn stale_network_generation_cannot_replace_visible_results() {

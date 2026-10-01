@@ -927,7 +927,7 @@ fn cw_caption(m: &crate::pms::PmsMovie) -> Option<std::ffi::CString> {
 // The under-tile metadata block's four metrics — the ONLY authority on its geometry, which
 // [`TileLabel::height`] hands back to the screens that must reserve room for it.
 /// poster bottom → the title block's first line.
-const UNDER_DROP: f32 = 30.0;
+pub(crate) const UNDER_DROP: f32 = 30.0;
 /// one title line's pitch (`Person Screen.dc.html`'s `line-height: 30px`).
 const UNDER_LINE_H: f32 = 30.0;
 /// title block → caption (the mock's `margin-top: 4px`).
@@ -1342,7 +1342,7 @@ pub(crate) fn label_band(p: Painter, rect: Rect, sty: &RowStyle) -> (f32, f32) {
 /// The focused tile's whole label block — title (with its optional Continue-Watching glyph) and
 /// caption — placed ONCE by [`place_label`] from the wider of its two runs, so both lines share one
 /// alignment: centred on the card together, or starting together at the card's leading edge.
-fn draw_label_block(
+pub(crate) fn draw_label_block(
     p: Painter,
     rect: Rect,
     sty: &RowStyle,

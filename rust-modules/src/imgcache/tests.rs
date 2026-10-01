@@ -39,6 +39,29 @@ fn library_art_has_a_durable_disk_key() {
 }
 
 #[test]
+fn stash_art_keys_isolate_account_version_and_transform_without_credentials() {
+    let source = "http://example.test/performer/1/image?t=12&apikey=secret";
+    let key = classify_stash("account-a", source, "still-v1").unwrap();
+    assert_eq!(key, classify_stash("account-a", &source.replace("secret", "other"), "still-v1").unwrap());
+    assert_ne!(key, classify_stash("account-b", source, "still-v1").unwrap());
+    assert_ne!(key, classify_stash("account-a", &source.replace("t=12", "t=13"), "still-v1").unwrap());
+    assert_ne!(key, classify_stash("account-a", source, "blur-v1").unwrap());
+    assert!(!key.name.contains("secret"));
+}
+
+#[test]
+fn stash_still_cache_survives_reopen_and_is_unavailable_to_other_accounts() {
+    let dir = TestDir::new();
+    let key = classify_stash("account-a", "http://example.test/scene/19/screenshot?t=1", "still-v1").unwrap();
+    let other = classify_stash("account-b", "http://example.test/scene/19/screenshot?t=1", "still-v1").unwrap();
+    let bytes = b"validated-still-image";
+    assert!(dir.cache(10, 1024).write_at(0, &key, bytes));
+    let reopened = dir.cache(10, 1024);
+    assert_eq!(reopened.read_at(0, &key).unwrap().bytes, bytes);
+    assert!(reopened.read_at(0, &other).is_none());
+}
+
+#[test]
 fn keys_include_namespace_source_version_and_every_transform() {
     let name = classify("server-a", POSTER).unwrap().name;
     assert_ne!(name, classify("server-b", POSTER).unwrap().name);

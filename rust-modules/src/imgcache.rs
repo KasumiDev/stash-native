@@ -35,6 +35,26 @@ pub(crate) struct CachedImage {
     pub stale: bool,
 }
 
+/// Provider artwork uses the same durable tier; callers supply an opaque account namespace.
+pub(crate) fn classify_stash(namespace: &str, source: &str, transform: &str) -> Option<DiskKey> {
+    if namespace.is_empty() || source.is_empty() || transform.is_empty() {
+        return None;
+    }
+    let (path, query) = source.split_once('?').unwrap_or((source, ""));
+    let mut params: Vec<_> = query.split('&').filter(|p| !p.is_empty()).filter(|p| {
+        let name = percent_decode(p.split_once('=').map_or(*p, |(name, _)| name));
+        !name.eq_ignore_ascii_case("apikey")
+    }).collect();
+    params.sort_unstable();
+    let canonical = format!("{path}?{}", params.join("&"));
+    let mut identity = Vec::new();
+    for field in ["stash-still-v1", namespace, &canonical, transform] {
+        identity.extend_from_slice(&(field.len() as u64).to_le_bytes());
+        identity.extend_from_slice(field.as_bytes());
+    }
+    Some(DiskKey { name: format!("image-{}.img", hex_digest(&identity)), legacy: None })
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Snapshot {
     pub hit: u64,

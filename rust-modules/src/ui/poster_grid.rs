@@ -16,6 +16,15 @@ use crate::ui::{Rect, Spring};
 pub(crate) const COLS: usize = 6;
 pub(crate) const GAP: f32 = (SCR_W - 2.0 * MARGIN_X - COLS as f32 * CARD_W) / (COLS as f32 - 1.0);
 pub(crate) const STYLE: RowStyle = RowStyle { gap: GAP, ..RowStyle::HOME };
+/// Provider-neutral collection cells; the caption bands and focus geometry are
+/// shared with the original Library grid regardless of artwork orientation.
+pub(crate) fn collection_style(portrait: bool, square: bool) -> (usize, RowStyle) {
+    let cols = if portrait || square { COLS } else { 4 };
+    let mut style = if portrait { RowStyle::HOME } else { RowStyle::EPISODE };
+    if square { style.w = CARD_W; style.h = CARD_W; }
+    style.gap = (SCR_W - 2. * MARGIN_X - cols as f32 * style.w) / (cols - 1) as f32;
+    (cols, style)
+}
 /// A COLLAPSED row's pitch; a row whose band is open adds its share of `card_row::BAND_OPEN`.
 pub(crate) const ROW_PITCH: f32 = CARD_H + LABEL_BAND_COLLAPSED + UNDER_LABEL_AIR;
 

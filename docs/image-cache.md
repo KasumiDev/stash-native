@@ -2,14 +2,14 @@
 
 ## Storage and ownership
 
-All reusable remote artwork enters `app/adapters/poster.rs` through the shared `ui::tex::Source`.
+Reusable Plex artwork enters `app/adapters/poster.rs` through the shared `ui::tex::Source`.
 Its two demand workers read the disk tier before fetching and decode off the render thread.
 `imgcache.rs` owns persistence; `ui::tex::TexCache` owns GPU residency. Screens choose the image
 and size, without choosing a caching policy. The sign-in QR code is transient authentication data
 and remains outside the artwork cache; bundled icons and fonts already live in the app package.
 
 Disk entries contain compressed image bytes and a small versioned header with fetch time and
-payload length. A SHA-256 filename identifies the stable Plex machine id (canonical server origin
+payload length. For Plex, a SHA-256 filename identifies the stable machine id (canonical server origin
 until an id is known), source and every requested transform. The outer `X-Plex-Token` is excluded.
 Source version queries, size, cover mode and format remain distinct. Only the recognized Plex
 avatar roster's volatile `c=` stamp is ignored. No request URL or token is stored as metadata.
@@ -25,13 +25,13 @@ fetch timestamp never moves on a hit. Writes use a temporary file and rename, ca
 size-bounded, and corrupt entries are removed and fetched again. Unavailable storage is a cache
 miss; a failed write cannot prevent the image from displaying.
 
-On a disk hit older than **24 hours**, stale artwork is displayed immediately. A separate refresh worker starts work
+For Plex, on a disk hit older than **24 hours**, stale artwork is displayed immediately. A separate refresh worker starts work
 when demand loading is idle, with at most 32 queued jobs and a bounded recent-attempt set to
 suppress retry storms. Refresh validates decoding before replacing a file and affects the next
 load; it never holds the source-store lock while accessing the network. A failed refresh keeps
 the old image. Changed versioned source paths miss immediately rather than waiting for expiry.
 
-RAM residency remains independent of library size: 64 source slots and a 44 MiB GPU texture
+Plex RAM residency remains independent of library size: 64 source slots and a 44 MiB GPU texture
 budget. Demand workers stop claiming requests when combined decoded and pending-upload pixels
 reach 8 MiB; already active decodes can temporarily exceed this admission threshold. If the GPU evicts an image while its source slot survives, the next draw requests its
 pixels again through the same disk-first path, respecting scrolling deferral and the source's
@@ -39,6 +39,15 @@ residency backoff. Sign-out advances the cache epoch and sweeps all
 candidate directories; requests capture that epoch when queued, so old work cannot read, remove,
 write or publish images after account erasure. Profile switching within one account retains
 reusable artwork. Filesystem deletion failures remain best effort, like the existing avatar cache.
+
+Stash artwork uses the same bounded disk tier through `stash_media/still_cache.rs`, with off-thread
+decoding and UI-thread texture ownership. Its hashed keys include the server/account namespace,
+versioned source URL, and still/blur transform; API keys are excluded from source identity and no
+credentials are stored as metadata. Entries contain validated static PNG thumbnails, including
+only a first-frame snapshot of animated portraits. A fresh static hit avoids fetching; a stale
+hit displays immediately and refreshes in the same bounded media worker. Animated portraits show
+the cached still while fetching their transient animation. Video previews are never persisted.
+Decoded buffers share Stash's 64 MiB media budget, and off-screen texture demands are retired.
 
 ## Reproducible television stress test
 

@@ -16,6 +16,7 @@ pub(crate) struct Playback {
     selected: Option<Selected>,
     resolved_url: Option<String>,
     completed: bool,
+    repause_at: Option<i64>,
     o_pending: bool,
     pub sync_error: Option<String>,
     pub o_count: Option<i64>,
@@ -33,6 +34,9 @@ enum Queued {
 struct ActivityClock {
     position: f64,
     wall: Duration,
+}
+fn paused_seek_landed(target: i64, pending: i64, frames: i32, position: i64) -> bool {
+    pending < 0 && frames >= 1 && position.saturating_add(15_000_000_000) >= target
 }
 impl ActivityClock {
     fn sample(&mut self, elapsed: Duration, position: f64, moving: bool) -> Duration {
@@ -108,6 +112,7 @@ impl Playback {
             selected: None,
             resolved_url: None,
             completed: false,
+            repause_at: None,
             o_pending: false,
             sync_error: None,
             o_count: None,
@@ -198,6 +203,11 @@ impl Playback {
         }
         player::pump(&mut self.session, &mut self.adapter, now_ms as u32);
         route::drain_route_start_results(&mut self.session);
+        if self.repause_at.is_some_and(|target| paused_seek_landed(target, player::seek_pending(), player::frames(), player::playpos_ns()))
+            && player::seek_preroll_active()
+            && player::finish_paused_seek(&mut self.adapter) {
+            self.repause_at = None;
+        }
         let position = player::playpos_ns().max(0) as f64 / 1e9;
         let elapsed = self
             .last_tick
@@ -237,12 +247,14 @@ impl Playback {
             return;
         }
         player::resume(&mut self.adapter);
+        self.repause_at = None;
     }
     pub fn seek(&mut self, seconds: f64) {
         if self.completed || !seconds.is_finite() {
             return;
         }
         let seconds = seconds.max(0.0);
+        let was_paused = player::TX.paused.load(std::sync::atomic::Ordering::Acquire);
         if let (Some(stream), Some(url), Some(id)) =
             (&self.selected, &self.resolved_url, &self.scene_id)
         {
@@ -270,6 +282,14 @@ impl Playback {
             }
         }
         self.last_tick = None;
+        if was_paused {
+            // A server-stream restart resets transport state. Restore the viewer's intent
+            // before the next pump, with the original bounded one-frame seek preroll.
+            player::TX.commit_paused(true);
+            player::TX.begin_paused_seek();
+            player::TX.resume_pend.store(true, std::sync::atomic::Ordering::Release);
+            self.repause_at = Some((seconds * 1e9) as i64);
+        }
         self.clock = ActivityClock {
             position: seconds,
             ..Default::default()
@@ -318,6 +338,7 @@ impl Playback {
         self.resolved_url = None;
         self.last_tick = None;
         self.completed = false;
+        self.repause_at = None;
         self.o_pending = false;
     }
     fn flush(&mut self, completed: bool) {
@@ -572,6 +593,14 @@ mod tests {
     #[test]
     fn transcode_seek_replaces_offset_and_preserves_auth_query() {
         assert_eq!(offset_url("https://example.test/scene/synthetic/stream.mp4?apikey=synthetic-key&start=5&resolution=STANDARD_HD",12.25),"https://example.test/scene/synthetic/stream.mp4?apikey=synthetic-key&resolution=STANDARD_HD&start=12.250");
+    }
+    #[test]
+    fn paused_marker_seek_waits_for_the_landed_frame() {
+        let target = 60_000_000_000;
+        assert!(!paused_seek_landed(target, target, 1, target));
+        assert!(!paused_seek_landed(target, -1, 0, target));
+        assert!(!paused_seek_landed(target, -1, 1, 0));
+        assert!(paused_seek_landed(target, -1, 1, target));
     }
     #[test]
     fn native_clock_updates_are_not_divided_by_render_frame_rate() {

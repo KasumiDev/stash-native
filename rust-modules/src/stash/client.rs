@@ -102,6 +102,14 @@ const SCENE: &str = "id title date details studio { id name } o_counter resume_t
 const GALLERY: &str = "id title image_count cover { id title paths { image thumbnail } } performers { id name image_path favorite o_counter } tags { id name image_path favorite }";
 
 impl Client {
+    /// UTC metadata reference captured by the off-frame adapter, delivered as a fact to screens.
+    pub(crate) fn reference_date(&self) -> (i32, u32, u32) {
+        let seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        date_from_epoch(seconds)
+    }
     pub fn new(config: Config) -> Result<Self, Error> {
         let endpoint = config.endpoint()?;
         Ok(Self { config, endpoint })
@@ -297,10 +305,41 @@ impl Client {
         serde_json::from_value(node.clone()).map_err(|_| Error::InvalidResponse)
     }
     pub fn scene(&self, id: &str) -> Result<Scene, Error> {
-        self.detail("findScene", SCENE, id)
+        self.detail(
+            "findScene",
+            &format!("{SCENE} scene_markers {{ id title seconds end_seconds screenshot }}"),
+            id,
+        )
     }
     pub fn performer(&self, id: &str) -> Result<Performer, Error> {
-        self.detail("findPerformer", PERFORMER, id)
+        self.detail(
+            "findPerformer",
+            &format!("{PERFORMER} details birthdate death_date hair_color tags {{ {TAG} }}"),
+            id,
+        )
+    }
+    pub fn performer_scene_tags(
+        &self,
+        performer_id: &str,
+        page: u32,
+    ) -> Result<Page<super::SceneTagSummary>, Error> {
+        let query = Query {
+            performer_id: Some(performer_id.into()),
+            page,
+            per_page: 50,
+            sort: "id".into(),
+            direction: Direction::Ascending,
+            ..Default::default()
+        };
+        self.list(
+            "findScenes",
+            "SceneFilterType",
+            "scene_filter",
+            "scenes",
+            &format!("id tags {{ {TAG} }}"),
+            &query,
+            query.relations(),
+        )
     }
     pub fn tag(&self, id: &str) -> Result<Tag, Error> {
         self.detail("findTag", TAG, id)
@@ -457,9 +496,29 @@ fn decode_response(status: u16, body: &[u8]) -> Result<Value, Error> {
         .ok_or(Error::InvalidResponse)
 }
 
+fn date_from_epoch(seconds: u64) -> (i32, u32, u32) {
+    // Civil date from an epoch-day count, independent of firmware libc struct layouts.
+    let z = (seconds / 86400) as i64 + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    ((y + i64::from(month <= 2)) as i32, month as u32, day as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn metadata_reference_date_respects_epoch_and_leap_days() {
+        assert_eq!(date_from_epoch(0), (1970, 1, 1));
+        assert_eq!(date_from_epoch(1_582_934_400), (2020, 2, 29));
+        assert_eq!(date_from_epoch(1_790_812_800), (2026, 10, 1));
+    }
     #[test]
     fn rejects_partial_graphql_data_and_http_errors() {
         assert_eq!(

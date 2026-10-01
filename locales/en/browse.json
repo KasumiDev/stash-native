@@ -2107,6 +2107,24 @@
     "value": "No images",
     "description": "Stash navigation, server settings, and image viewer"
   },
+  "stash.performer.age": {
+    "value": "Age {age}",
+    "description": "Age displayed in the performer hero",
+    "args": { "age": "i64" }
+  },
+  "stash.performer.hair": {
+    "value": "Hair: {hair}",
+    "description": "Hair color displayed in the performer hero",
+    "args": { "hair": "str" }
+  },
+  "stash.performer.popular_tags": {
+    "value": "Most-used scene tags",
+    "description": "Five tags used on the most distinct scenes by a performer"
+  },
+  "stash.performer.tags_error": {
+    "value": "Could not load popular tags",
+    "description": "Retryable performer tag aggregation error"
+  },
   "browse.stash.home": {
     "value": "Home",
     "description": "Stash navigation, server settings, and image viewer"

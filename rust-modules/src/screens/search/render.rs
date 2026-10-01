@@ -207,58 +207,15 @@ fn field<H: SearchLike>(screen: &SearchScreen, f: &mut DrawFrame<'_, '_, H>, p: 
         layout::FIELD.w,
         layout::FIELD.h,
     );
-    let blank = data.query.trim().is_empty();
-    let hot = screen.hot.pos;
-    let ink = if blank {
-        theme::cross(theme::TEXT_TERTIARY, theme::TEXT_SECONDARY, hot)
-    } else {
-        theme::cross(theme::TEXT_SECONDARY, ink_target(screen.editing), hot)
-    };
-    let (run_dx, caret_dx) = run_layout(
-        data.run_w,
-        run_caret_w(blank, data.head_w),
-        rect.w,
-        screen.editing,
-    );
-    let (cap_top, cap_base) = crate::text::text_cap_band(theme::size::HERO, 1);
-    let pad = descent_pad(
-        rect.h,
-        crate::text::text_height(theme::size::HERO, 1),
-        cap_top,
-        cap_base,
-    );
-    {
-        let _clip = f.clip(p, Rect::new(rect.x, rect.y, rect.w, rect.h + pad));
-        Label::new(data.run.as_ptr(), theme::size::HERO, ink)
-            .bold()
-            .draw(p, Rect::new(rect.x + run_dx, rect.y, rect.w, rect.h));
+    crate::ui::search_field::draw(p, rect, &data.query, data.caret, screen.editing,
+        screen.blink_us < super::BLINK_US, screen.hot.pos, f.cx.measure);
+    if ghost_shown(&data.query) {
+        let blank = data.query.trim().is_empty();
+        let (_, caret_dx) = run_layout(data.run_w, run_caret_w(blank, data.head_w), rect.w, screen.editing);
         let text_y = crate::text::text_vcenter_y(theme::size::HERO, 1, rect.cy());
-        if caret_shown(screen.editing, screen.blink_us < super::BLINK_US) {
-            p.rect(
-                Rect::new(
-                    rect.x + caret_dx,
-                    text_y + cap_top,
-                    CARET_W,
-                    cap_base - cap_top,
-                ),
-                0.0,
-                theme::TEXT_PRIMARY,
-                theme::TEXT_PRIMARY,
-                0.0,
-            );
-        }
-        if ghost_shown(&data.query) {
-            let y = crate::text::baseline_y(theme::size::BODY, 0, theme::size::HERO, 1, text_y);
-            p.text(
-                crate::i18n::msg::browse_search_one_more_c().as_ptr(),
-                rect.x + caret_dx + CARET_W + GHOST_GAP,
-                y,
-                theme::size::BODY,
-                theme::cross(theme::TEXT_TERTIARY, theme::TEXT_SECONDARY, hot),
-                0,
-                0,
-            );
-        }
+        p.text(crate::i18n::msg::browse_search_one_more_c().as_ptr(), rect.x + caret_dx + CARET_W + GHOST_GAP,
+            crate::text::baseline_y(theme::size::BODY, 0, theme::size::HERO, 1, text_y),
+            theme::size::BODY, theme::cross(theme::TEXT_TERTIARY, theme::TEXT_SECONDARY, screen.hot.pos), 0, 0);
     }
     if let Some(line) = &data.scope_line {
         Label::new(line.as_ptr(), theme::size::CAPTION, theme::TEXT_TERTIARY).draw(
@@ -564,14 +521,17 @@ fn ghost_shown(q: &str) -> bool {
     n > 0 && n + 1 == crate::search::MIN_QUERY
 }
 
+#[cfg(test)]
 fn caret_shown(editing: bool, phase_on: bool) -> bool {
     editing && phase_on
 }
 
+#[cfg(test)]
 fn descent_pad(box_h: f32, full_h: f32, cap_top: f32, cap_base: f32) -> f32 {
     (full_h - box_h * 0.5 - (cap_top + cap_base) * 0.5).max(0.0)
 }
 
+#[cfg(test)]
 fn ink_target(editing: bool) -> [f32; 4] {
     if editing {
         theme::FIELD_EDITING_INK

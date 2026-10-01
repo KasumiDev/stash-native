@@ -103,7 +103,12 @@ impl SceneDetailScreen {
         let p = f.painter;
         let fill = theme::SURFACE_APP;
         p.rect(Rect::FULL, 0., fill, fill, 0.);
-        if let Some(&(texture, w, h)) = f.cx.views.textures.get(&format!("scene:{}", scene.id)) {
+        if let Some(&(texture, w, h)) =
+            f.cx.views
+                .textures
+                .get(&format!("preview:scene:{}", scene.id))
+                .or_else(|| f.cx.views.textures.get(&format!("scene:{}", scene.id)))
+        {
             p.tex_uv(
                 texture,
                 Rect::FULL.cover_uv(w, h, crate::ui::Crop::Centre),
@@ -442,6 +447,17 @@ impl Machine<StashHost> for SceneDetailScreen {
     ) -> Handled {
         self.content
             .detail_inset(self.chain(cx).btn_y + StatusOverlay::CTRL_H + theme::space::XL);
+        let preview = if self.content.scroll() < TITLE_BOTTOM {
+            self.content.scene().and_then(|s| {
+                s.paths
+                    .preview
+                    .as_ref()
+                    .map(|url| (format!("scene:{}", s.id), url.clone()))
+            })
+        } else {
+            None
+        };
+        self.content.media_override(Vec::new(), preview);
         match event {
             ScreenEvent::Activate(key) if self.activate(*key, fx) => Handled::Yes,
             ScreenEvent::PressCommit(_)

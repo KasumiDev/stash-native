@@ -10,6 +10,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 pub(crate) mod playback;
+mod still_cache;
 const BUDGET: usize = 64 * 1024 * 1024;
 const ASSET_LIMIT: usize = 32 * 1024 * 1024;
 const WORKERS: usize = 32;
@@ -93,6 +94,7 @@ pub(crate) struct MediaManager {
     active: Arc<AtomicUsize>,
     focus: Option<(String, String, u64)>,
     preview: Option<Job>,
+    cache_namespace: String,
 }
 impl MediaManager {
     pub fn new() -> Self {
@@ -105,6 +107,19 @@ impl MediaManager {
             active: Arc::new(AtomicUsize::new(0)),
             focus: None,
             preview: None,
+            cache_namespace: String::new(),
+        }
+    }
+    /// Configuration changes cancel old workers before their frames can reach a new account.
+    pub fn set_cache_account(&mut self, config: &crate::stash::Config) {
+        let namespace = still_cache::namespace(config);
+        if self.cache_namespace != namespace {
+            self.jobs.clear();
+            self.images.clear();
+            self.done.clear();
+            self.retry_at.clear();
+            self.stop_preview();
+            self.cache_namespace = namespace;
         }
     }
     pub fn request_image(&mut self, key: &str, url: &str, animated: bool) {
@@ -154,6 +169,7 @@ impl MediaManager {
                         true,
                         self.budget.clone(),
                         self.active.clone(),
+                        None,
                     );
                 }
             }
@@ -173,6 +189,8 @@ impl MediaManager {
                     false,
                     self.budget.clone(),
                     self.active.clone(),
+                    crate::imgcache::classify_stash(&self.cache_namespace, url,
+                        if key.starts_with("blur:") { "blur-1280x720-v1" } else { "contain-1280x720-v1" }),
                 ) {
                     self.jobs.insert(key.clone(), job);
                 }
@@ -223,6 +241,7 @@ fn spawn(
     preview: bool,
     budget: Arc<AtomicUsize>,
     active: Arc<AtomicUsize>,
+    cache_key: Option<crate::imgcache::DiskKey>,
 ) -> Option<Job> {
     if !reserve_counter(&active, 1, WORKERS) {
         return None;
@@ -233,6 +252,7 @@ fn spawn(
     let r = retry.clone();
     let (tx, rx) = mpsc::sync_channel(1);
     let (s, f, a) = (stop.clone(), finished.clone(), active.clone());
+    let cache_generation = crate::imgcache::generation();
     if std::thread::Builder::new()
         .name("stash media".into())
         .stack_size(256 * 1024)
@@ -240,7 +260,8 @@ fn spawn(
             if preview {
                 decode_preview(&key, &url, &s, &tx, &budget);
             } else {
-                decode_image(&key, &url, animated, &s, &tx, &budget, &r);
+                still_cache::decode_image(&key, &url, animated, &s, &tx, &budget, &r,
+                    cache_key.as_ref().map(|key| (cache_generation, key)));
             }
             f.store(true, Ordering::Release);
             a.fetch_sub(1, Ordering::AcqRel);
@@ -553,59 +574,48 @@ impl Drop for Source {
         crate::stream::http_close(&mut *self.hs);
     }
 }
-fn decode_image(
-    key: &str,
+fn fetch_image(
     url: &str,
-    animated: bool,
     stop: &Arc<AtomicBool>,
-    tx: &mpsc::SyncSender<MediaFrame>,
     budget: &Arc<AtomicUsize>,
     blocked: &AtomicBool,
-) {
+) -> Option<(Vec<u8>, Allocation)> {
     let Some(mut source) = Source::open(url, 0, stop.clone(), budget, blocked) else {
-        return;
+        return None;
     };
     if source.size as usize > ASSET_LIMIT {
-        return;
+        return None;
     }
     let encoded_limit = source.size as usize;
     let (bytes, _encoded_allocation) = if let Some(bytes) = source.bytes.take() {
         // HTTPS already owns its response. Transfer its permit with the bytes;
         // copying a large animation briefly doubled compressed-media admission.
         let Some(allocation) = source._allocation.take() else {
-            return;
+            return None;
         };
         (bytes, allocation)
     } else {
         let Some(allocation) = reserve_or_retry(budget, encoded_limit, blocked) else {
-            return;
+            return None;
         };
         let mut bytes = Vec::with_capacity(encoded_limit);
         let mut chunk = [0u8; 8192];
         loop {
             let n = source.read(&mut chunk);
             if n < 0 {
-                return;
+                return None;
             }
             if n == 0 {
                 break;
             }
             if !append_asset_chunk(&mut bytes, &chunk[..n as usize], encoded_limit) {
-                return;
+                return None;
             }
         }
         (bytes, allocation)
     };
     drop(source);
-    if animated
-        && image::guess_format(&bytes).ok() == Some(image::ImageFormat::WebP)
-        && play_webp(key, &bytes, stop, tx, budget)
-    {
-        return;
-    }
-    if let Some(frame) = static_frame(key, &bytes, budget, blocked) {
-        let _ = deliver(tx, stop, frame);
-    }
+    Some((bytes, _encoded_allocation))
 }
 fn append_asset_chunk(bytes: &mut Vec<u8>, chunk: &[u8], reserved: usize) -> bool {
     if bytes
@@ -649,6 +659,7 @@ fn static_frame(
     let image = image::DynamicImage::from_decoder(decoder).ok()?;
     let thumb = image.thumbnail(width.min(1280), height.min(720));
     drop(image);
+    let thumb = if key.starts_with("blur:") { thumb.blur(24.) } else { thumb };
     let rgba = thumb.into_rgba8();
     let (output_width, output_height) = rgba.dimensions();
     let pixels = rgba.into_raw();

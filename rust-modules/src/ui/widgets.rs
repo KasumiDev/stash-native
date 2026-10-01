@@ -621,6 +621,22 @@ pub(crate) fn card(p: Painter, frame: Rect, art: Art, rad: f32, focused: bool, s
     card_named(p, frame, art, None, rad, focused, scale, f)
 }
 
+/// Full artwork inside a uniform collection cell, sharing its card material.
+/// Portrait scenes keep their complete composition rather than losing it to a cover crop.
+pub(crate) fn contained_card(p: Painter, frame: Rect, image: Option<(u32, f32, f32)>, rad: f32, lift: f32) {
+    if p.is_recording() { return; }
+    p.rrect_sheened(frame, rad, theme::CARD_PLACEHOLDER);
+    let Some((texture, width, height)) = image.filter(|(t, w, h)| *t != 0 && *w > 0. && *h > 0.) else { return };
+    let image_frame = contain_frame(frame, width, height);
+    p.tex_carded(texture, crate::gfx::UV_FULL, image_frame, rad.min(image_frame.w * 0.5), theme::TINT_WHITE, lift);
+}
+
+pub(crate) fn contain_frame(frame: Rect, width: f32, height: f32) -> Rect {
+    let factor = (frame.w / width).min(frame.h / height);
+    let (w, h) = (width * factor, height * factor);
+    Rect::new(frame.cx() - w * 0.5, frame.cy() - h * 0.5, w, h)
+}
+
 /// [`card`] for a caller whose art is a bare path to a collection's thumb and who knows the
 /// collection's `name` (the collection page's header): when the thumb is a server composite and so
 /// resolves to our baked fan, the name is set over it (`collection_tile::draw_fan_name`), as the
