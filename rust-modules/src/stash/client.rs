@@ -47,6 +47,9 @@ pub struct Query {
     pub direction: Direction,
     pub performer_id: Option<String>,
     pub tag_id: Option<String>,
+    /// All tags must match, including the singular route tag when present.
+    pub tag_ids: Vec<String>,
+    pub rating100: Option<i32>,
     pub gallery_id: Option<String>,
 }
 impl Default for Query {
@@ -59,6 +62,8 @@ impl Default for Query {
             direction: Direction::Descending,
             performer_id: None,
             tag_id: None,
+            tag_ids: Vec::new(),
+            rating100: None,
             gallery_id: None,
         }
     }
@@ -72,12 +77,21 @@ impl Query {
         let mut v = json!({});
         for (key, id) in [
             ("performers", &self.performer_id),
-            ("tags", &self.tag_id),
             ("galleries", &self.gallery_id),
         ] {
             if let Some(id) = id {
                 v[key] = json!({"value":[id],"modifier":"INCLUDES_ALL"});
             }
+        }
+        let mut tags = self.tag_ids.clone();
+        tags.extend(self.tag_id.iter().cloned());
+        tags.sort();
+        tags.dedup();
+        if !tags.is_empty() {
+            v["tags"] = json!({"value":tags,"modifier":"INCLUDES_ALL"});
+        }
+        if let Some(rating) = self.rating100 {
+            v["rating100"] = json!({"value":rating,"modifier":"EQUALS"});
         }
         v
     }
@@ -98,7 +112,7 @@ pub struct Client {
 const PERFORMER: &str = "id name image_path favorite o_counter";
 const TAG: &str = "id name image_path favorite";
 const IMAGE: &str = "id title paths { image thumbnail }";
-const SCENE: &str = "id title date details studio { id name } o_counter resume_time play_duration play_count paths { screenshot preview stream webp } files { duration width height video_codec audio_codec format } sceneStreams { url mime_type label } performers { id name image_path favorite o_counter } tags { id name image_path favorite }";
+const SCENE: &str = "id title date rating100 details studio { id name } o_counter resume_time play_duration play_count paths { screenshot preview stream webp } files { duration width height video_codec audio_codec format } sceneStreams { url mime_type label } performers { id name image_path favorite o_counter } tags { id name image_path favorite }";
 const GALLERY: &str = "id title image_count cover { id title paths { image thumbnail } } performers { id name image_path favorite o_counter } tags { id name image_path favorite }";
 
 impl Client {
@@ -221,7 +235,7 @@ impl Client {
     }
 
     pub fn scenes(&self, q: &Query) -> Result<Page<Scene>, Error> {
-        self.list(
+        let mut page: Page<Scene> = self.list(
             "findScenes",
             "SceneFilterType",
             "scene_filter",
@@ -229,7 +243,14 @@ impl Client {
             SCENE,
             q,
             q.relations(),
-        )
+        )?;
+        let mut seen = std::collections::HashSet::new();
+        page.items.retain(|scene| seen.insert(scene.id.clone()));
+        if q.sort == "date" && q.direction == Direction::Descending {
+            page.items
+                .sort_by(|a, b| b.date.cmp(&a.date).then_with(|| a.id.cmp(&b.id)));
+        }
+        Ok(page)
     }
     pub fn performers(&self, q: &Query, favorite: Option<bool>) -> Result<Page<Performer>, Error> {
         let mut relations = json!({});
@@ -542,6 +563,26 @@ mod tests {
         assert_eq!(q.filter()["per_page"], 120);
         assert_eq!(q.filter()["page"], 1);
         assert_eq!(q.relations()["tags"]["modifier"], "INCLUDES_ALL");
+    }
+    #[test]
+    fn scene_rating_and_tag_intersection_are_typed_and_deduplicated() {
+        let q = Query {
+            rating100: Some(100),
+            tag_id: Some("viewed".into()),
+            tag_ids: vec!["other".into(), "viewed".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            q.relations()["rating100"],
+            json!({"value":100,"modifier":"EQUALS"})
+        );
+        assert_eq!(
+            q.relations()["tags"],
+            json!({"value":["other","viewed"],"modifier":"INCLUDES_ALL"})
+        );
+        let scene: Scene =
+            serde_json::from_value(json!({"id":"missing-rating","rating100":null})).unwrap();
+        assert_eq!(scene.rating100, None);
     }
     #[test]
     fn scene_decoding_keeps_stash_ids() {

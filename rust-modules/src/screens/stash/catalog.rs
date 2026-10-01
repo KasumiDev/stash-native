@@ -3,7 +3,9 @@ use crate::screens::stash_registry::*;
 #[cfg(test)]
 use crate::stash::Config;
 use crate::stash::{Direction, Query};
-use crate::stores::stash::{PageData, Section, Tile, Work};
+use crate::stores::stash::{
+    PageData, Section, ShelfId, ShelfPage, ShelfScope, ShelfSpec, Tile, Work,
+};
 use crate::ui::card_row::{self, CardRow, RowStyle, TileLabel};
 use crate::ui::consts::{CARD_DY, GRID_TOP_Y, MARGIN_X, PEEK_Y, SCR_H, SCR_W, TITLE_DY};
 use crate::ui::frame::Budget;
@@ -19,6 +21,7 @@ use std::collections::HashMap;
 #[derive(Default)]
 struct State {
     generation: u32,
+    provisional: bool,
     loading: bool,
     error: String,
     query: String,
@@ -27,7 +30,6 @@ struct State {
     scroll: f32,
     editing: u8,
     caret: usize,
-    shelf_loading: bool,
     append: bool,
     media_at: u32,
     covered: bool,
@@ -38,6 +40,7 @@ struct State {
 impl LogicalState for State {
     fn write(&self, c: &mut Canon) {
         c.u32(self.generation)
+            .bool(self.provisional)
             .bool(self.loading)
             .str(&self.error)
             .str(&self.query)
@@ -57,7 +60,17 @@ impl LogicalState for State {
         s.push_str(&format!("page={} loading={}", self.page, self.loading));
     }
 }
+#[derive(Default)]
+struct ShelfProgress {
+    page: u32,
+    loading: bool,
+    exhausted: bool,
+    error: String,
+}
+
 struct Row {
+    pinned: bool,
+    shelf_id: Option<ShelfId>,
     title: String,
     tiles: Vec<Tile>,
     keys: Vec<u32>,
@@ -69,7 +82,7 @@ struct Row {
 }
 const CONTROLS_Y: f32 = GRID_TOP_Y - TITLE_DY;
 const CONTENT_TOP: f32 = CONTROLS_Y + 64. + theme::space::XL + theme::space::MD;
-const CONTENT_VIEW: Rect = Rect::new(0., CONTENT_TOP, SCR_W, SCR_H - CONTENT_TOP);
+
 pub struct StashScreen {
     route: StashArg,
     entry: EntryId,
@@ -80,6 +93,10 @@ pub struct StashScreen {
     next_key: u32,
     home_shelves: bool,
     detail_inset: Option<f32>,
+    home_heading: f32,
+    hit_top: f32,
+    shelf_generation: u32,
+    shelf_progress: HashMap<ShelfId, ShelfProgress>,
     scroll_motion: crate::ui::Spring,
     scroll_target: f32,
     bands: crate::ui::poster_grid::GridBands,
@@ -89,9 +106,7 @@ pub struct StashScreen {
 }
 impl StashScreen {
     fn pinned(row: &Row) -> bool {
-        row.tiles
-            .first()
-            .is_some_and(|t| t.identity.starts_with("control:"))
+        row.pinned
     }
     fn row_y(&self, row: &Row) -> f32 {
         if Self::pinned(row) {
@@ -123,11 +138,13 @@ impl StashScreen {
         })
     }
     pub fn new(route: StashArg, entry: EntryId) -> Self {
+        let provisional = matches!(route, StashArg::Tag(_));
         Self {
             route,
             entry,
             state: State {
                 page: 1,
+                provisional,
                 ..Default::default()
             },
             data: PageData::default(),
@@ -136,6 +153,10 @@ impl StashScreen {
             next_key: 1,
             home_shelves: false,
             detail_inset: None,
+            home_heading: PEEK_Y - TITLE_DY,
+            hit_top: 0.,
+            shelf_generation: 0,
+            shelf_progress: HashMap::new(),
             scroll_motion: crate::ui::Spring::at(0.),
             scroll_target: 0.,
             bands: crate::ui::poster_grid::GridBands::new(),
@@ -179,9 +200,32 @@ impl StashScreen {
         self.scroll_target = value;
         self.scroll_motion = crate::ui::Spring::at(value);
     }
+    pub(crate) fn hit_clearance(&mut self, value: f32) {
+        self.hit_top = value.max(0.).min(SCR_H);
+    }
+    fn hit_view(&self) -> Rect {
+        let top = self.hit_top.max(self.content_view().y);
+        Rect::new(0., top, SCR_W, SCR_H - top)
+    }
+    pub(crate) fn home_heading_top(&mut self, value: f32) {
+        if (self.home_heading - value).abs() > 0.5 {
+            self.home_heading = value;
+            self.rebuild();
+        }
+    }
     pub(crate) fn home_scroll_target(&self, key: u32) -> Option<f32> {
-        self.position(key)
-            .map(|(r, _)| (self.rows[r].y - GRID_TOP_Y - CARD_DY).max(PEEK_Y - GRID_TOP_Y))
+        self.position(key).map(|(r, _)| {
+            (self.rows[r].y - GRID_TOP_Y - CARD_DY).max(self.home_heading + TITLE_DY - GRID_TOP_Y)
+        })
+    }
+    fn reveal_top(&self) -> f32 {
+        if matches!(self.route, StashArg::Search) {
+            300.
+        } else if matches!(self.route, StashArg::Performer(_)) {
+            255.
+        } else {
+            CONTENT_TOP
+        }
     }
     fn content_view(&self) -> Rect {
         if self.home_shelves {
@@ -190,7 +234,7 @@ impl StashScreen {
         } else if matches!(self.route, StashArg::Search) {
             Rect::new(0., 300., SCR_W, SCR_H - 300.)
         } else {
-            CONTENT_VIEW
+            Rect::FULL
         }
     }
     pub(crate) fn first_group(&self) -> Option<GroupId> {
@@ -235,7 +279,12 @@ impl StashScreen {
     fn load(&mut self, fx: &mut Effects<'_, StashHost>) {
         self.state.generation = self.state.generation.wrapping_add(1);
         self.state.loading = true;
-        self.state.shelf_loading = false;
+        if !self.state.append && self.state.page == 1 {
+            self.shelf_generation = self.shelf_generation.wrapping_add(1);
+            for progress in self.shelf_progress.values_mut() {
+                progress.loading = false;
+            }
+        }
         self.state.error.clear();
         if matches!(self.route, StashArg::Search) && self.state.query.trim().is_empty() {
             self.state.loading = false;
@@ -266,12 +315,15 @@ impl StashScreen {
                 .sections
                 .iter()
                 .filter(|section| {
-                    section.shelf && data.lazy_tags.iter().any(|tag| tag.name == section.title)
+                    section
+                        .shelf_id
+                        .as_ref()
+                        .is_some_and(|id| data.shelves.iter().any(|spec| &spec.id == id))
                 })
                 .cloned()
                 .collect::<Vec<_>>();
             self.data = data.clone();
-            if matches!(self.route, StashArg::Performer(_)) {
+            if matches!(self.route, StashArg::Performer(_) | StashArg::Tag(_)) {
                 self.data.sections.splice(0..0, retained);
             } else {
                 self.data.sections.extend(retained);
@@ -315,7 +367,8 @@ impl StashScreen {
             .sections
             .iter()
             .filter(|section| {
-                !matches!(self.route, StashArg::Home) || section.title == "Performers"
+                section.shelf_id.is_none()
+                    && (!matches!(self.route, StashArg::Home) || section.title == "Performers")
             })
             .any(|section| {
                 if section.tiles.is_empty() {
@@ -361,7 +414,6 @@ impl StashScreen {
     fn prefetch(&mut self, focused: Option<u32>, fx: &mut Effects<'_, StashHost>) {
         if self.state.covered
             || self.state.loading
-            || self.state.shelf_loading
             || self.state.editing != 0
             || !self.state.error.is_empty()
             || !self.data.has_more
@@ -373,36 +425,169 @@ impl StashScreen {
         self.state.append = true;
         self.load(fx);
     }
-    fn next_shelf(&mut self, fx: &mut Effects<'_, StashHost>) {
-        if self.state.covered {
+    fn shelf_scope(&self) -> Option<ShelfScope> {
+        match &self.route {
+            StashArg::Home => Some(ShelfScope::Home),
+            StashArg::Performer(id) => Some(ShelfScope::Performer(id.clone())),
+            StashArg::Tag(id) => Some(ShelfScope::Tag(id.clone())),
+            _ => None,
+        }
+    }
+    fn request_shelf(&mut self, spec: ShelfSpec, fx: &mut Effects<'_, StashHost>) {
+        let progress = self.shelf_progress.entry(spec.id.clone()).or_default();
+        if progress.loading || progress.exhausted || self.state.covered {
             return;
         }
-        if self.state.shelf_loading || self.data.lazy_tags.is_empty() {
-            return;
-        }
-        self.state.shelf_loading = true;
-        let tag = self.data.lazy_tags.remove(0);
+        progress.loading = true;
+        progress.error.clear();
         fx.push(Fx::App(StashFx::Work(
             Addr {
                 to: fx.from(),
-                req: RequestId(self.state.generation),
+                req: RequestId(self.shelf_generation),
             },
-            if let StashArg::Performer(id) = &self.route {
-                Work::PerformerTagShelf {
-                    performer_id: id.clone(),
-                    tag,
-                    generation: self.state.generation,
-                }
-            } else {
-                Work::TagShelf {
-                    tag,
-                    generation: self.state.generation,
-                }
+            Work::ShelfPage {
+                spec,
+                generation: self.shelf_generation,
+                page: progress.page + 1,
             },
         )));
     }
+    fn next_shelf(&mut self, fx: &mut Effects<'_, StashHost>) {
+        if self.state.covered
+            || self
+                .shelf_progress
+                .values()
+                .any(|p| p.page == 0 && p.loading)
+        {
+            return;
+        }
+        if self
+            .rows
+            .iter()
+            .filter(|r| r.shelf_id.is_some())
+            .last()
+            .is_some_and(|r| self.row_y(r) > SCR_H + r.style.h)
+        {
+            return;
+        }
+        let next = self
+            .data
+            .shelves
+            .iter()
+            .find(|spec| {
+                self.shelf_progress
+                    .get(&spec.id)
+                    .is_none_or(|p| p.page == 0 && !p.loading && !p.exhausted)
+            })
+            .cloned();
+        if let Some(spec) = next {
+            self.request_shelf(spec, fx);
+        }
+    }
+    fn prefetch_shelf(&mut self, key: u32, fx: &mut Effects<'_, StashHost>) {
+        let Some((r, c)) = self.position(key) else {
+            return;
+        };
+        let Some(id) = self.rows[r].shelf_id.clone() else {
+            return;
+        };
+        if c + 12 < self.rows[r].tiles.len() {
+            return;
+        }
+        if let Some(spec) = self.data.shelves.iter().find(|s| s.id == id).cloned() {
+            self.request_shelf(spec, fx);
+        }
+    }
+    fn land_shelf(
+        &mut self,
+        scope: &ShelfScope,
+        id: &ShelfId,
+        generation: u32,
+        page: u32,
+        result: &Result<ShelfPage, String>,
+    ) -> bool {
+        if generation != self.shelf_generation || self.shelf_scope().as_ref() != Some(scope) {
+            return false;
+        }
+        let Some(progress) = self.shelf_progress.get_mut(id) else {
+            return false;
+        };
+        if !progress.loading || page != progress.page + 1 {
+            return false;
+        }
+        progress.loading = false;
+        let response = match result {
+            Ok(p) => p,
+            Err(e) => {
+                progress.error = e.clone();
+                self.rebuild();
+                return true;
+            }
+        };
+        if response.section.shelf_id.as_ref() != Some(id) {
+            progress.error = crate::stash::Error::InvalidResponse.to_string();
+            self.rebuild();
+            return true;
+        }
+        progress.page = page;
+        progress.exhausted = !response.has_more
+            || page as usize * crate::stores::stash::SHELF_PAGE_SIZE as usize >= response.count;
+        if let Some(existing) = self
+            .data
+            .sections
+            .iter_mut()
+            .find(|s| s.shelf_id.as_ref() == Some(id))
+        {
+            let before = existing.tiles.len();
+            for tile in &response.section.tiles {
+                if !existing.tiles.iter().any(|t| t.identity == tile.identity) {
+                    existing.tiles.push(tile.clone());
+                }
+            }
+            if before == existing.tiles.len() {
+                progress.exhausted = true;
+            }
+        } else if !response.section.tiles.is_empty() {
+            let at = if matches!(self.route, StashArg::Home) {
+                self.data.sections.len()
+            } else {
+                self.data
+                    .sections
+                    .iter()
+                    .position(|s| !s.shelf)
+                    .unwrap_or(self.data.sections.len())
+            };
+            self.data.sections.insert(at, response.section.clone());
+        }
+        let order = self
+            .data
+            .shelves
+            .iter()
+            .map(|s| s.id.clone())
+            .collect::<Vec<_>>();
+        if matches!(self.route, StashArg::Home) {
+            if self.data.sections.len() > 2 {
+                self.data.sections[2..].sort_by_key(|s| {
+                    s.shelf_id
+                        .as_ref()
+                        .and_then(|id| order.iter().position(|x| x == id))
+                        .unwrap_or(usize::MAX)
+                });
+            }
+        } else {
+            self.data.sections.sort_by_key(|s| {
+                s.shelf_id
+                    .as_ref()
+                    .and_then(|id| order.iter().position(|x| x == id))
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        self.rebuild();
+        true
+    }
     fn control(id: &str, title: String, action: Action) -> Tile {
         Tile {
+            scene_metadata: None,
             identity: format!("control:{id}"),
             title,
             o_count: None,
@@ -417,6 +602,7 @@ impl StashScreen {
         let mut controls = Vec::new();
         if matches!(self.route, StashArg::Search) {
             sections.push(Section {
+                shelf_id: None,
                 title: String::new(),
                 tiles: vec![Self::control(
                     "search",
@@ -427,7 +613,8 @@ impl StashScreen {
                 shelf: false,
             });
         }
-        if !self.state.error.is_empty() {
+        if !self.state.error.is_empty() || self.shelf_progress.values().any(|p| !p.error.is_empty())
+        {
             controls.push(Self::control("retry", "Retry".into(), Action::Refresh));
         }
         if matches!(self.route, StashArg::Scenes) {
@@ -442,6 +629,7 @@ impl StashScreen {
         }
         if !self.home_shelves && !controls.is_empty() {
             sections.push(Section {
+                shelf_id: None,
                 title: String::new(),
                 tiles: controls,
                 portrait: false,
@@ -459,7 +647,7 @@ impl StashScreen {
                 })
                 .map(|(_, s)| s.clone()),
         );
-        let mut old_motion = std::mem::take(&mut self.rows).into_iter();
+        let mut old_rows = std::mem::take(&mut self.rows);
         let mut y = if self.detail_inset.is_some()
             && self.data.scene.is_none()
             && self.data.performer.is_none()
@@ -468,7 +656,7 @@ impl StashScreen {
         } else if let Some(inset) = self.detail_inset {
             inset
         } else if self.home_shelves {
-            PEEK_Y
+            self.home_heading + TITLE_DY
         } else if sections.first().is_some_and(control_section) {
             CONTROLS_Y
         } else {
@@ -540,7 +728,7 @@ impl StashScreen {
                         theme::space::MD
                     };
                 }
-                let keys = tiles
+                let keys: Vec<u32> = tiles
                     .iter()
                     .map(|t| {
                         let identity = if control {
@@ -553,7 +741,10 @@ impl StashScreen {
                                 } else {
                                     ""
                                 },
-                                s.title,
+                                s.shelf_id
+                                    .as_ref()
+                                    .map(|id| format!("{id:?}"))
+                                    .unwrap_or_else(|| s.title.clone()),
                                 t.identity
                             )
                         };
@@ -565,7 +756,20 @@ impl StashScreen {
                         *key
                     })
                     .collect();
+                let motion = old_rows
+                    .iter()
+                    .position(|old| {
+                        if s.shelf_id.is_some() {
+                            old.shelf_id == s.shelf_id
+                        } else {
+                            old.shelf_id.is_none() && old.keys.first() == keys.first()
+                        }
+                    })
+                    .map(|at| old_rows.remove(at).motion)
+                    .unwrap_or_else(CardRow::new);
                 self.rows.push(Row {
+                    pinned: control && self.detail_inset.is_none() && !self.home_shelves,
+                    shelf_id: s.shelf_id.clone(),
                     title: if i == 0 && s.title != self.data.title {
                         s.title.clone()
                     } else {
@@ -573,10 +777,7 @@ impl StashScreen {
                     },
                     tiles: tiles.to_vec(),
                     keys,
-                    motion: old_motion
-                        .next()
-                        .map(|r| r.motion)
-                        .unwrap_or_else(CardRow::new),
+                    motion,
                     style,
                     y,
                     collection,
@@ -591,8 +792,8 @@ impl StashScreen {
                         TileLabel::height(true) + theme::space::XL
                     };
             }
-            if control {
-                y = self.content_view().y - CARD_DY;
+            if control && self.detail_inset.is_none() {
+                y = self.reveal_top() - CARD_DY;
             }
         }
     }
@@ -668,7 +869,7 @@ impl StashScreen {
             }
         }
         for row in &self.rows {
-            if self.row_y(row) > 1080. || self.row_y(row) + row.style.h < CONTENT_VIEW.y {
+            if self.row_y(row) > 1080. || self.row_y(row) + row.style.h < self.content_view().y {
                 continue;
             }
             for (index, tile) in row.tiles.iter().enumerate() {
@@ -680,6 +881,19 @@ impl StashScreen {
                 }
                 if let Some(url) = &tile.image {
                     images.push((tile.identity.clone(), url.clone()));
+                    if let Some(metadata) = &tile.scene_metadata {
+                        let ratio = cx
+                            .views
+                            .textures
+                            .get(&format!("preview:{}", tile.identity))
+                            .or_else(|| cx.views.textures.get(&tile.identity))
+                            .filter(|(_, w, h)| *w > 0. && *h > 0.)
+                            .map(|(_, w, h)| w / h)
+                            .or(metadata.aspect_ratio);
+                        if ratio.is_none_or(|a| !crate::ui::widgets::scene_aspect_is_standard(a)) {
+                            images.push((format!("blur:{}", tile.identity), url.clone()));
+                        }
+                    }
                 }
             }
         }
@@ -726,6 +940,24 @@ impl StashScreen {
                 fx.push(Fx::Nav(NavOp::Push(StashArg::Player(scene.id))));
             }
             Action::Refresh => {
+                let failed = self
+                    .data
+                    .shelves
+                    .iter()
+                    .filter(|s| {
+                        self.shelf_progress
+                            .get(&s.id)
+                            .is_some_and(|p| !p.error.is_empty())
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !failed.is_empty() {
+                    for spec in failed {
+                        self.request_shelf(spec, fx);
+                    }
+                    self.rebuild();
+                    return;
+                }
                 if self.state.loading {
                     return;
                 }
@@ -763,6 +995,36 @@ impl Focusable<StashHost> for StashScreen {
         self.grid(|g| g.group_of(&self.internal(*key), cx))
     }
     fn neighbour(&self, k: FocusKey<u32>, d: Dir, cx: &Cx<'_, StashHost>) -> Step<u32> {
+        if let Some((r, c)) = self.position(k.elem) {
+            let next = match d {
+                Dir::Up => r.checked_sub(1),
+                Dir::Down => (r + 1 < self.rows.len()).then_some(r + 1),
+                _ => None,
+            };
+            if let Some(next) = next {
+                let target = &self.rows[next];
+                let from_x = self
+                    .place(&k.elem, cx, At::SpringTarget)
+                    .map_or(target.style.margin_x + target.style.w * 0.5, |p| {
+                        p.rest_rect.cx()
+                    });
+                let column = card_row::column_near_x(
+                    from_x,
+                    target.style.margin_x,
+                    target.style.w + target.style.gap,
+                    target.style.w,
+                    target.motion.scroll_x(),
+                    target.keys.len(),
+                    c,
+                );
+                if let Some(elem) = target.keys.get(column) {
+                    return Step::Move(FocusKey {
+                        entry: self.entry,
+                        elem: *elem,
+                    });
+                }
+            }
+        }
         self.grid(|g| {
             match g.neighbour(
                 FocusKey {
@@ -785,7 +1047,7 @@ impl Focusable<StashHost> for StashScreen {
         self.grid(|g| g.place(&self.internal(*k), cx, at))
             .map(|mut place| {
                 if !Self::pinned(&self.rows[r]) {
-                    place.clip = place.clip.intersect(self.content_view());
+                    place.clip = place.clip.intersect(self.hit_view());
                 }
                 place
             })
@@ -823,6 +1085,18 @@ impl Machine<StashHost> for StashScreen {
         cx: &Cx<'_, StashHost>,
         fx: &mut Effects<'_, StashHost>,
     ) -> Handled {
+        if matches!(
+            ev,
+            ScreenEvent::Input(_) | ScreenEvent::Enter(Enter::Restored)
+        ) || matches!(
+            ev,
+            ScreenEvent::FocusMoved {
+                by: By::Dir | By::Pointer,
+                ..
+            }
+        ) {
+            self.state.provisional = false;
+        }
         match ev {
             ScreenEvent::Mount => {
                 self.rebuild();
@@ -894,66 +1168,50 @@ impl Machine<StashHost> for StashScreen {
                 fx.invalidate(crate::ui::present::Provenance::Landing(fx.from()));
                 Handled::Yes
             }
-            ScreenEvent::Async(_, StashMsg::ShelfLoaded { generation, result })
-                if *generation == self.state.generation =>
-            {
-                self.state.shelf_loading = false;
+            ScreenEvent::Async(
+                _,
+                StashMsg::ShelfPageLoaded {
+                    scope,
+                    id,
+                    generation,
+                    page,
+                    result,
+                },
+            ) => {
                 let old_focus = cx
                     .focus
                     .current
                     .and_then(|k| self.position(k.elem).map(|(r, _)| (k.elem, self.rows[r].y)));
-                match result {
-                    Ok(section) => {
-                        if !section.tiles.is_empty() {
-                            if let Some(existing) = self.data.sections.iter_mut().find(|old| {
-                                old.title == section.title && old.shelf == section.shelf
-                            }) {
-                                *existing = section.clone();
-                            } else if matches!(self.route, StashArg::Performer(_)) {
-                                let at = self
-                                    .data
-                                    .sections
-                                    .iter()
-                                    .position(|section| !section.shelf)
-                                    .unwrap_or(self.data.sections.len());
-                                self.data.sections.insert(at, section.clone());
-                            } else {
-                                self.data.sections.push(section.clone());
-                            }
-                            if matches!(self.route, StashArg::Performer(_)) {
-                                self.data.sections.sort_by(|a, b| {
-                                    b.shelf.cmp(&a.shelf).then_with(|| {
-                                        if a.shelf && b.shelf {
-                                            a.title.to_lowercase().cmp(&b.title.to_lowercase())
-                                        } else {
-                                            std::cmp::Ordering::Equal
-                                        }
-                                    })
-                                });
-                            } else if matches!(self.route, StashArg::Home)
-                                && self.data.sections.len() > 2
-                            {
-                                self.data.sections[2..].sort_by(|a, b| {
-                                    a.title.to_lowercase().cmp(&b.title.to_lowercase())
-                                });
-                            }
-                            self.rebuild();
-                            if let Some((key, old_y)) = old_focus {
-                                if let Some((r, _)) = self.position(key) {
-                                    let shift = self.rows[r].y - old_y;
-                                    self.state.scroll += shift;
-                                    self.scroll_target += shift;
-                                    self.scroll_motion.pos += shift;
-                                }
-                            }
-                            self.media(cx, fx);
-                        } else {
-                            self.next_shelf(fx);
+                if self.land_shelf(scope, id, *generation, *page, result) {
+                    if self.state.provisional && matches!(self.route, StashArg::Tag(_)) {
+                        self.shelf_scroll(0.);
+                        if let Some(key) =
+                            self.rows.first().and_then(|row| row.keys.first()).copied()
+                        {
+                            fx.push(Fx::Deliver(
+                                fx.from(),
+                                Delivery::Screen(ScreenEvent::Enter(Enter::Fresh {
+                                    focus: FocusTarget::Elem(FocusKey {
+                                        entry: self.entry,
+                                        elem: key,
+                                    }),
+                                })),
+                            ));
+                        }
+                    } else if let Some((key, y)) = old_focus {
+                        if let Some((r, _)) = self.position(key) {
+                            let shift = self.rows[r].y - y;
+                            self.state.scroll += shift;
+                            self.scroll_target += shift;
+                            self.scroll_motion.pos += shift;
                         }
                     }
-                    Err(e) => self.state.error = e.clone(),
+                    self.media(cx, fx);
+                    if result.is_ok() {
+                        self.next_shelf(fx);
+                    }
+                    fx.invalidate(crate::ui::present::Provenance::Landing(fx.from()));
                 }
-                fx.invalidate(crate::ui::present::Provenance::Landing(fx.from()));
                 Handled::Yes
             }
             ScreenEvent::Activate(key) => {
@@ -1003,13 +1261,20 @@ impl Machine<StashHost> for StashScreen {
                             self.state.scroll,
                             row.y + row.style.h + TileLabel::height(true)
                                 - (SCR_H - crate::ui::consts::MARGIN_Y),
-                            row.y - self.content_view().y - card_row::heading_lift_max(&row.style),
+                            row.y
+                                - if matches!(self.route, StashArg::Performer(_)) {
+                                    crate::ui::hero_content::pinned_name_bottom(cx.measure)
+                                } else {
+                                    self.reveal_top()
+                                }
+                                - card_row::heading_lift_max(&row.style),
                             max,
                         );
                     }
                 }
                 self.media(cx, fx);
                 self.prefetch(Some(to.elem), fx);
+                self.prefetch_shelf(to.elem, fx);
                 if self
                     .position(to.elem)
                     .is_some_and(|(r, _)| r + 2 >= self.rows.len())
@@ -1148,11 +1413,13 @@ impl Machine<StashHost> for StashScreen {
 fn append_page(page: &mut PageData, data: &PageData) {
     let mut added = 0;
     for section in &data.sections {
-        if let Some(existing) = page
-            .sections
-            .iter_mut()
-            .find(|s| s.title == section.title && s.shelf == section.shelf)
-        {
+        if let Some(existing) = page.sections.iter_mut().find(|s| {
+            if section.shelf_id.is_some() {
+                s.shelf_id == section.shelf_id
+            } else {
+                s.shelf_id.is_none() && s.title == section.title && s.shelf == section.shelf
+            }
+        }) {
             for tile in &section.tiles {
                 if !existing.tiles.iter().any(|t| t.identity == tile.identity) {
                     existing.tiles.push(tile.clone());
@@ -1234,14 +1501,19 @@ impl Screen<StashHost> for StashScreen {
     }
     fn draw(&mut self, f: &mut DrawFrame<'_, '_, StashHost>) {
         let p = f.painter;
-        for row in &self.rows {
+        for row in self
+            .rows
+            .iter()
+            .filter(|r| !Self::pinned(r))
+            .chain(self.rows.iter().filter(|r| Self::pinned(r)))
+        {
             let y = self.row_y(row);
             if y > 1080.
                 || y + row.style.h
                     < if Self::pinned(row) {
                         100.
                     } else {
-                        CONTENT_VIEW.y
+                        self.content_view().y
                     }
             {
                 continue;
@@ -1267,7 +1539,10 @@ impl Screen<StashHost> for StashScreen {
                     f.cx.measure,
                 );
             }
-            let buttons = Self::pinned(row);
+            let buttons = row
+                .tiles
+                .first()
+                .is_some_and(|tile| tile.identity.starts_with("control:"));
             if !buttons && !row.collection {
                 let focused =
                     f.cx.focus
@@ -1295,19 +1570,57 @@ impl Screen<StashHost> for StashScreen {
                         } else {
                             f.cx.views.textures.get(&tile.identity)
                         };
-                        Art::Texture {
-                            key: &tile.identity,
-                            image: image.copied(),
-                            portrait: tile.identity.starts_with("performer:"),
+                        if let Some(metadata) = &tile.scene_metadata {
+                            Art::Scene {
+                                key: &tile.identity,
+                                image: image.copied(),
+                                background: f
+                                    .cx
+                                    .views
+                                    .textures
+                                    .get(&format!("blur:{}", tile.identity))
+                                    .or_else(|| f.cx.views.textures.get(&tile.identity))
+                                    .copied(),
+                                aspect_ratio: metadata.aspect_ratio,
+                            }
+                        } else {
+                            Art::Texture {
+                                key: &tile.identity,
+                                image: image.copied(),
+                                portrait: tile.identity.starts_with("performer:"),
+                            }
                         }
                     },
                     |_| None,
-                    |i| TileLabel::titled(&row.tiles[i].title, &row.tiles[i].caption),
+                    |i| {
+                        let tile = &row.tiles[i];
+                        let caption = tile
+                            .scene_metadata
+                            .as_ref()
+                            .map(|m| {
+                                crate::ui::widgets::scene_caption(
+                                    &tile.caption,
+                                    m.duration_seconds,
+                                    m.rating100,
+                                )
+                            })
+                            .unwrap_or_else(|| tile.caption.clone());
+                        TileLabel::titled(&tile.title, &caption)
+                    },
                     |p, i, x, focused| {
                         if let Some(count) = row.tiles[i].o_count {
-                            let scale = row.motion.scale(i) * if focused { crate::ui::press::scale() } else { 1. };
-                            crate::ui::widgets::o_count_mark(p,
-                                Rect::new(x, y, row.style.w, row.style.h).scaled(scale), count, f.cx.measure);
+                            let scale = row.motion.scale(i)
+                                * if focused {
+                                    crate::ui::press::scale()
+                                } else {
+                                    1.
+                                };
+                            crate::ui::widgets::o_count_mark(
+                                p,
+                                Rect::new(x, y, row.style.w, row.style.h).scaled(scale),
+                                count,
+                                f.cx.measure,
+                            );
                         }
                     },
                     f.cx.measure,
@@ -1363,10 +1676,16 @@ impl Screen<StashHost> for StashScreen {
                     let lift =
                         ((scale - 1.) / (row.style.focus_scale - 1.).max(0.001)).clamp(0., 1.);
                     if row.style.w > row.style.h {
-                        crate::ui::widgets::contained_card(
+                        crate::ui::widgets::scene_card(
                             p,
                             rect,
                             image.copied(),
+                            f.cx.views
+                                .textures
+                                .get(&format!("blur:{}", tile.identity))
+                                .or_else(|| f.cx.views.textures.get(&tile.identity))
+                                .copied(),
+                            tile.scene_metadata.as_ref().and_then(|m| m.aspect_ratio),
                             row.style.tile_radius(rect, scale),
                             lift,
                         );
@@ -1407,7 +1726,18 @@ impl Screen<StashHost> for StashScreen {
                             .iter()
                             .find(|band| band.row == row.ordinal)
                             .map_or(0., |band| band.expansion);
-                        let title = TileLabel::titled(&tile.title, &tile.caption)
+                        let caption = tile
+                            .scene_metadata
+                            .as_ref()
+                            .map(|m| {
+                                crate::ui::widgets::scene_caption(
+                                    &tile.caption,
+                                    m.duration_seconds,
+                                    m.rating100,
+                                )
+                            })
+                            .unwrap_or_else(|| tile.caption.clone());
+                        let title = TileLabel::titled(&tile.title, &caption)
                             .revealed(card_row::band_reveal(expansion));
                         let base_bottom = rect.cy() + rect.h / scale * 0.5;
                         card_row::draw_label_block(
@@ -1449,10 +1779,19 @@ impl Screen<StashHost> for StashScreen {
                 }
             }
         }
-        if !self.state.error.is_empty() {
+        let shelf_error = self
+            .shelf_progress
+            .values()
+            .find(|p| !p.error.is_empty())
+            .map(|p| p.error.as_str());
+        if !self.state.error.is_empty() || shelf_error.is_some() {
             label(
                 p,
-                &self.state.error,
+                if self.state.error.is_empty() {
+                    shelf_error.unwrap_or("")
+                } else {
+                    &self.state.error
+                },
                 Rect::new(72., 1000., 1776., 50.),
                 theme::size::CAPTION,
                 theme::TEXT_SECONDARY,
@@ -1484,6 +1823,7 @@ mod tests {
     use super::*;
     fn tile(id: &str) -> Tile {
         Tile {
+            scene_metadata: None,
             identity: format!("scene:{id}"),
             title: id.into(),
             o_count: None,
@@ -1497,6 +1837,7 @@ mod tests {
         PageData {
             title: "Scenes".into(),
             sections: vec![Section {
+                shelf_id: None,
                 title: "Scenes".into(),
                 tiles: ids.iter().map(|id| tile(id)).collect(),
                 portrait: false,
@@ -1504,6 +1845,23 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+    #[test]
+    fn collection_viewport_includes_pixels_above_controls() {
+        let screen = StashScreen::new(StashArg::Scenes, EntryId(1));
+        assert_eq!(screen.content_view().y, 0.);
+        assert_eq!(screen.content_view().h, SCR_H);
+        assert!(screen.reveal_top() > crate::ui::widgets::CHIP_FRAME.y);
+    }
+    #[test]
+    fn pinned_name_blocks_hidden_pointer_targets_without_clipping_collection_pixels() {
+        let mut screen = StashScreen::new(StashArg::Performer("1".into()), EntryId(1));
+        screen.hit_clearance(271.);
+        assert_eq!(screen.content_view().y, 0.);
+        assert_eq!(screen.content_view().h, SCR_H);
+        assert_eq!(screen.hit_view().y, 271.);
+        screen.hit_clearance(0.);
+        assert_eq!(screen.hit_view().y, 0.);
     }
     #[test]
     fn refresh_keeps_keys_when_order_changes() {
@@ -1524,6 +1882,7 @@ mod tests {
         let mut person = tile("1");
         person.identity = "performer:1".into();
         screen.data.sections.push(Section {
+            shelf_id: None,
             title: "Performers".into(),
             tiles: vec![person],
             portrait: true,
@@ -1540,6 +1899,7 @@ mod tests {
         let mut screen = StashScreen::new(StashArg::Home, EntryId(1));
         screen.data = data(&["a"]);
         screen.data.sections.push(Section {
+            shelf_id: None,
             title: "Tag 1".into(),
             tiles: vec![tile("a")],
             portrait: false,
@@ -1574,6 +1934,7 @@ mod tests {
         let mut screen = StashScreen::home(EntryId(1));
         screen.data = data(&["a"]);
         screen.data.sections.push(Section {
+            shelf_id: None,
             title: "Performers".into(),
             tiles: vec![tile("b")],
             portrait: true,
@@ -1616,6 +1977,20 @@ mod tests {
         assert!(screen.rows[0].title.is_empty());
     }
     #[test]
+    fn detail_error_controls_keep_document_flow_and_scroll_with_content() {
+        let mut screen = StashScreen::new(StashArg::Performer("1".into()), EntryId(1));
+        screen.data = data(&["a"]);
+        screen.data.performer = Some(crate::stash::Performer::default());
+        screen.detail_inset = Some(800.);
+        screen.state.error = "Disconnected".into();
+        screen.rebuild();
+        assert!(!StashScreen::pinned(&screen.rows[0]));
+        assert!(screen.rows[1].y > screen.rows[0].y + screen.rows[0].style.h);
+        let y = screen.row_y(&screen.rows[0]);
+        screen.state.scroll = 100.;
+        assert_eq!(screen.row_y(&screen.rows[0]), y - 100.);
+    }
+    #[test]
     fn tags_use_square_collection_cells_without_refresh_or_search() {
         let mut screen = StashScreen::new(StashArg::Tags, EntryId(1));
         screen.data = data(&["a", "b"]);
@@ -1649,6 +2024,7 @@ mod tests {
         screen.data.sections.insert(
             0,
             Section {
+                shelf_id: None,
                 title: "Favorite tag".into(),
                 tiles: vec![tile("b")],
                 portrait: false,
@@ -1734,6 +2110,252 @@ mod tests {
         screen.rebuild();
         assert_eq!(screen.rows.len(), 1);
         assert_eq!(screen.rows[0].tiles.len(), 50);
+    }
+    #[test]
+    fn home_first_column_up_targets_immediately_previous_shelf() {
+        let config = Config::default();
+        let textures = HashMap::new();
+        let playback = PlaybackView::default();
+        let cx = Cx {
+            views: Views {
+                textures: &textures,
+                config: &config,
+                playback: &playback,
+            },
+            tick: Tick::default(),
+            measure: &Measure,
+            press: PressRead::default(),
+            focus: FocusRead::default(),
+            owner: InputOwner::Entry(EntryId(1)),
+        };
+        let mut screen = StashScreen::home(EntryId(1));
+        screen.data = data(&["hero"]);
+        for name in ["Performers", "Tag A", "Tag B"] {
+            let mut section = data(&["a", "b", "c"]).sections.remove(0);
+            section.title = name.into();
+            screen.data.sections.push(section);
+        }
+        screen.rebuild();
+        screen.state.scroll = screen.home_scroll_target(screen.rows[2].keys[0]).unwrap();
+        for col in [0, 2] {
+            let from = FocusKey {
+                entry: screen.entry,
+                elem: screen.rows[2].keys[col],
+            };
+            assert!(
+                matches!(screen.neighbour(from,Dir::Up,&cx),Step::Move(k) if k.elem==screen.rows[1].keys[col])
+            );
+        }
+        assert!(matches!(
+            screen.neighbour(
+                FocusKey {
+                    entry: screen.entry,
+                    elem: screen.rows[0].keys[0]
+                },
+                Dir::Up,
+                &cx
+            ),
+            Step::Edge
+        ));
+        screen.data.sections[1].portrait = true;
+        screen.rebuild();
+        let from = FocusKey {
+            entry: screen.entry,
+            elem: screen.rows[1].keys[1],
+        };
+        let source = screen.place(&from.elem, &cx, At::SpringTarget).unwrap().rect;
+        let Step::Move(to) = screen.neighbour(from, Dir::Up, &cx) else {
+            panic!("adjacent shelf missing")
+        };
+        let dest = screen.place(&to.elem, &cx, At::SpringTarget).unwrap().rect;
+        assert!(
+            (source.cx() - dest.cx()).abs()
+                <= (screen.rows[0].style.w + screen.rows[0].style.gap) * 0.5
+        );
+    }
+    fn shelf_screen() -> (StashScreen, ShelfSpec) {
+        let mut screen = StashScreen::new(StashArg::Performer("1".into()), EntryId(1));
+        let spec = ShelfSpec {
+            id: ShelfId::Favorites,
+            title: "Favorites".into(),
+            scope: ShelfScope::Performer("1".into()),
+        };
+        screen.data = data(&["a"]);
+        screen.data.shelves = vec![spec.clone()];
+        screen.shelf_generation = 7;
+        screen.shelf_progress.insert(
+            spec.id.clone(),
+            ShelfProgress {
+                loading: true,
+                ..Default::default()
+            },
+        );
+        (screen, spec)
+    }
+    #[test]
+    fn fresh_tag_landing_follows_first_shelf_but_restored_focus_keeps_its_grid() {
+        let config = Config::default();
+        let textures = HashMap::new();
+        let playback = PlaybackView::default();
+        for restored in [false, true] {
+            let mut screen = StashScreen::new(StashArg::Tag("1".into()), EntryId(1));
+            screen.data = data(&["a"]);
+            screen.rebuild();
+            let old = screen.rows[0].keys[0];
+            let cx = Cx {
+                views: Views {
+                    textures: &textures,
+                    config: &config,
+                    playback: &playback,
+                },
+                tick: Tick::default(),
+                measure: &Measure,
+                press: PressRead::default(),
+                focus: FocusRead {
+                    current: Some(FocusKey {
+                        entry: screen.entry,
+                        elem: old,
+                    }),
+                    ..Default::default()
+                },
+                owner: InputOwner::Entry(screen.entry),
+            };
+            let spec = ShelfSpec {
+                id: ShelfId::Favorites,
+                title: "Favorites".into(),
+                scope: ShelfScope::Tag("1".into()),
+            };
+            screen.data.shelves = vec![spec.clone()];
+            screen.shelf_generation = 7;
+            screen.shelf_progress.insert(
+                spec.id.clone(),
+                ShelfProgress {
+                    loading: true,
+                    ..Default::default()
+                },
+            );
+            let mut out = Vec::new();
+            let mut present = crate::ui::present::Present::new();
+            {
+                let mut fx =
+                    Effects::new(&mut out, MachineId::Instance(InstanceId(1)), &mut present);
+                if restored {
+                    screen.step(&ScreenEvent::Enter(Enter::Restored), &cx, &mut fx);
+                }
+                screen.step(
+                    &ScreenEvent::Async(
+                        RequestId(7),
+                        StashMsg::ShelfPageLoaded {
+                            scope: spec.scope.clone(),
+                            id: spec.id.clone(),
+                            generation: 7,
+                            page: 1,
+                            result: Ok(crate::stores::stash::fixture_shelf(&spec, 1)),
+                        },
+                    ),
+                    &cx,
+                    &mut fx,
+                );
+            }
+            let seats = out
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        &e.fx,
+                        Fx::Deliver(_, Delivery::Screen(ScreenEvent::Enter(Enter::Fresh { .. })))
+                    )
+                })
+                .count();
+            assert_eq!(seats, usize::from(!restored));
+            assert_eq!(screen.test_focus_identity(old), Some("scene:a"));
+            if !restored {
+                assert_eq!(screen.state.scroll, 0.);
+                assert_eq!(screen.rows[0].shelf_id, Some(ShelfId::Favorites));
+            }
+        }
+    }
+    #[test]
+    fn shelf_pages_append_past_fifty_preserve_keys_and_reject_stale_scope() {
+        let (mut screen, spec) = shelf_screen();
+        let first = crate::stores::stash::fixture_shelf(&spec, 1);
+        assert!(!screen.land_shelf(
+            &ShelfScope::Performer("2".into()),
+            &spec.id,
+            7,
+            1,
+            &Ok(first.clone())
+        ));
+        assert!(!screen.land_shelf(&spec.scope, &spec.id, 6, 1, &Ok(first.clone())));
+        assert!(screen.land_shelf(&spec.scope, &spec.id, 7, 1, &Ok(first)));
+        let key = screen.rows[0].keys[0];
+        let identity = screen.rows[0].tiles[0].identity.clone();
+        let mut second = crate::stores::stash::fixture_shelf(&spec, 2);
+        // Independently exercise appending even a shelf whose synthetic favorites are sparse.
+        second.section.tiles = (51..=100).map(|n| tile(&n.to_string())).collect();
+        second.has_more = true;
+        screen.shelf_progress.get_mut(&spec.id).unwrap().loading = true;
+        assert!(!screen.land_shelf(&spec.scope, &spec.id, 7, 3, &Ok(second.clone())));
+        assert!(screen.land_shelf(&spec.scope, &spec.id, 7, 2, &Ok(second)));
+        assert_eq!(screen.test_focus_identity(key), Some(identity.as_str()));
+        assert!(screen.rows[0].tiles.len() > 50);
+        assert!(!screen.land_shelf(
+            &spec.scope,
+            &spec.id,
+            7,
+            2,
+            &Ok(crate::stores::stash::fixture_shelf(&spec, 2))
+        ));
+    }
+    #[test]
+    fn shelf_prefetch_single_inflight_and_failure_retries_same_page() {
+        let (mut screen, spec) = shelf_screen();
+        let mut response = crate::stores::stash::fixture_shelf(&spec, 1);
+        response.section.tiles = (1..=50).map(|n| tile(&n.to_string())).collect();
+        response.has_more = true;
+        response.count = 120;
+        screen.land_shelf(&spec.scope, &spec.id, 7, 1, &Ok(response));
+        let near = screen.rows[0].keys[38];
+        let early = screen.rows[0].keys[0];
+        let mut out = Vec::new();
+        let mut present = crate::ui::present::Present::new();
+        {
+            let mut fx = Effects::new(&mut out, MachineId::Instance(InstanceId(1)), &mut present);
+            screen.prefetch_shelf(early, &mut fx);
+            assert!(out.is_empty());
+        }
+        {
+            let mut fx = Effects::new(&mut out, MachineId::Instance(InstanceId(1)), &mut present);
+            screen.prefetch_shelf(near, &mut fx);
+            screen.prefetch_shelf(near, &mut fx);
+        }
+        assert_eq!(out.len(), 1);
+        screen.land_shelf(&spec.scope, &spec.id, 7, 2, &Err("Disconnected".into()));
+        assert_eq!(screen.shelf_progress[&spec.id].page, 1);
+        {
+            let mut fx = Effects::new(&mut out, MachineId::Instance(InstanceId(1)), &mut present);
+            screen.request_shelf(spec.clone(), &mut fx);
+        }
+        assert_eq!(out.len(), 2);
+        assert!(matches!(
+            &out[1].fx,
+            Fx::App(StashFx::Work(_, Work::ShelfPage { page: 2, .. }))
+        ));
+    }
+    #[test]
+    fn shelf_identity_survives_label_changes_and_duplicate_labels() {
+        let (mut screen, spec) = shelf_screen();
+        let mut first = crate::stores::stash::fixture_shelf(&spec, 1);
+        first.section.tiles = vec![tile("1")];
+        screen.land_shelf(&spec.scope, &spec.id, 7, 1, &Ok(first));
+        let key = screen.rows[0].keys[0];
+        screen.data.sections[0].title = "Localized name".into();
+        screen.rebuild();
+        assert_eq!(screen.rows[0].keys[0], key);
+        let mut other = screen.data.sections[0].clone();
+        other.shelf_id = Some(ShelfId::Tag("different".into()));
+        screen.data.sections.insert(1, other);
+        screen.rebuild();
+        assert_ne!(screen.rows[0].keys[0], screen.rows[1].keys[0]);
     }
     struct Measure;
     impl crate::ui::machine::Measure for Measure {

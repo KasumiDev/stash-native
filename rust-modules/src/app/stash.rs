@@ -256,11 +256,19 @@ fn fixture_texture(key: &str, phase: u32, old: u32) -> u32 {
             }
         }
     }
+    if key.starts_with("blur:") {
+        if let Some(image)=image::RgbaImage::from_raw(w as u32,h as u32,pixels.clone()) {
+            pixels=image::imageops::blur(&image,12.).into_raw();
+        }
+    }
     crate::gfx::upload_rgba(old, w as i32, h as i32, pixels.as_ptr())
 }
 fn fixture_dimensions(key: &str) -> (usize, usize) {
     if key.contains("performer:") { (96, 144) }
-    else if key.starts_with("scene:") && key.rsplit(':').next().and_then(|id| id.parse::<usize>().ok()).is_some_and(|id| id % 3 == 0) { (90, 160) }
+    else if key.contains("scene:") {
+        let id=key.rsplit(':').next().and_then(|id|id.parse::<usize>().ok()).unwrap_or(1);
+        if id%7==0 {(320,90)} else if id%5==0 {(144,144)} else if id%3==0 {(90,160)} else {(160,90)}
+    }
     else if key.starts_with("tag:") { (128, 128) }
     else { (160, 90) }
 }
@@ -861,11 +869,13 @@ mod tests {
         let data = crate::stores::stash::PageData {
             title: "Scenes".into(),
             sections: vec![crate::stores::stash::Section {
+                shelf_id: None,
                 title: "Scenes".into(),
                 portrait: false,
                 shelf: false,
                 tiles: (0..12)
                     .map(|i| crate::stores::stash::Tile {
+                        scene_metadata: None,
                         identity: format!("scene:fixture{i}"),
                         title: format!("Fixture scene {i}"),
                         o_count: None,

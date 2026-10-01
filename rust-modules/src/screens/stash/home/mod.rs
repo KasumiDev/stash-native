@@ -121,6 +121,10 @@ impl LogicalState for HomeScreen {
 impl Focusable<StashHost> for HomeScreen {
     fn groups(&self, cx: &Cx<'_, StashHost>, out: &mut Vec<GroupSpec>) {
         self.hero(cx, |g| g.groups(cx, out));
+        if let Some(hero) = out.iter_mut().find(|group| group.id == GROUP) {
+            hero.edge[2] = EdgeRule::Screen;
+            hero.edge[3] = EdgeRule::Screen;
+        }
         self.shelves.groups(cx, out);
     }
     fn group_of(&self, key: &u32, cx: &Cx<'_, StashHost>) -> Option<GroupId> {
@@ -188,6 +192,10 @@ impl Machine<StashHost> for HomeScreen {
         cx: &Cx<'_, StashHost>,
         fx: &mut Effects<'_, StashHost>,
     ) -> Handled {
+        let actions = self.rects(cx)[0];
+        self.shelves.home_heading_top(
+            actions.y + self.snap.pos * SNAP_EXTENT + actions.h + theme::space::XL,
+        );
         match event {
             ScreenEvent::Input(InputEvent {
                 kind:
@@ -480,10 +488,12 @@ mod tests {
             scenes,
             sections: vec![
                 Section {
+                    shelf_id: None,
                     title: "Newest scenes".into(),
                     portrait: false,
                     shelf: true,
                     tiles: vec![Tile {
+                        scene_metadata: None,
                         identity: "scene:1".into(),
                         title: "Scene 1".into(),
                         o_count: None,
@@ -494,10 +504,12 @@ mod tests {
                     }],
                 },
                 Section {
+                    shelf_id: None,
                     title: "Performers".into(),
                     portrait: true,
                     shelf: true,
                     tiles: vec![Tile {
+                        scene_metadata: None,
                         identity: "performer:1".into(),
                         title: "Favorite performer".into(),
                         o_count: Some(10),
@@ -569,6 +581,39 @@ mod tests {
         assert_eq!(
             home.hero_preview(),
             Some(("hero:1".into(), "fixture://preview/1".into()))
+        );
+        let mut links = Vec::new();
+        home.links(&mut links);
+        let owner = InputOwner::Entry(EntryId(1));
+        let mut engine = crate::ui::focus::FocusEngine::new();
+        engine.set(
+            owner,
+            FocusKey {
+                entry: EntryId(1),
+                elem: HERO,
+            },
+            Some(GROUP),
+            By::Restore,
+        );
+        assert!(
+            matches!(engine.move_dir(owner,&home,&links,Dir::Right,&cx),crate::ui::focus::Outcome::Moved{to,..} if to.elem==HERO+1)
+        );
+        assert_eq!(
+            engine.move_dir(owner, &home, &links, Dir::Right, &cx),
+            crate::ui::focus::Outcome::Edge(EdgeRule::Screen)
+        );
+        engine.set(
+            owner,
+            FocusKey {
+                entry: EntryId(1),
+                elem: HERO,
+            },
+            Some(GROUP),
+            By::Restore,
+        );
+        assert_eq!(
+            engine.move_dir(owner, &home, &links, Dir::Left, &cx),
+            crate::ui::focus::Outcome::Edge(EdgeRule::Screen)
         );
         home.flip(-1, 20);
         assert_eq!(home.scene().unwrap().id, "12");

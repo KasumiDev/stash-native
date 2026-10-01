@@ -241,6 +241,8 @@ pub(crate) enum Art<'a> {
     Poster(Option<&'a PmsMovie>),
     /// Provider-neutral decoded artwork, using the same card composite and motion admission.
     Texture { key: &'a str, image: Option<(u32, f32, f32)>, portrait: bool },
+    /// Uniform scene card: complete foreground over its blurred still when needed.
+    Scene { key: &'a str, image: Option<(u32, f32, f32)>, background: Option<(u32, f32, f32)>, aspect_ratio: Option<f32> },
     /// **A landscape tile of a real catalog row** — an episode's own still, with the watched disc
     /// and (through `card_row::resume_bar`) the resume bar a poster wears.
     ///
@@ -273,7 +275,7 @@ pub(crate) enum Art<'a> {
 impl Art<'_> {
     fn motion_identity(&self) -> Option<crate::ui::card_motion::Identity> {
         use std::hash::{Hash, Hasher};
-        if let Self::Texture { key, .. } = self {
+        if let Self::Texture { key, .. } | Self::Scene { key, .. } = self {
             let mut hash = std::collections::hash_map::DefaultHasher::new();
             key.hash(&mut hash);
             return Some(crate::ui::card_motion::Identity { owner: key.as_ptr() as usize, asset: hash.finish() });
@@ -283,7 +285,7 @@ impl Art<'_> {
             Self::Still(Some(m)) => (*m as *const PmsMovie as usize, m.sid, still_key(m), 1),
             Self::Thumb { sid, key, .. } => (key.as_ptr() as usize, *sid, *key, 2),
             Self::Person { sid, key, .. } => (key.as_ptr() as usize, *sid, *key, 3),
-            Self::Poster(None) | Self::Still(None) | Self::Texture { .. } => return None,
+            Self::Poster(None) | Self::Still(None) | Self::Texture { .. } | Self::Scene { .. } => return None,
         };
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         (sid.raw(), key, kind).hash(&mut hash);
@@ -588,7 +590,7 @@ pub(crate) fn art_uv(art: &Art, tw: f32, th: f32, r: Rect) -> [f32; 4] {
 pub(crate) fn art_crop(art: &Art) -> crate::ui::Crop {
     match art {
         Art::Person { .. } | Art::Texture { portrait: true, .. } => crate::ui::Crop::Headshot,
-        Art::Poster(_) | Art::Still(_) | Art::Thumb { .. } | Art::Texture { portrait: false, .. } => crate::ui::Crop::Centre,
+        Art::Poster(_) | Art::Still(_) | Art::Thumb { .. } | Art::Texture { portrait: false, .. } | Art::Scene { .. } => crate::ui::Crop::Centre,
     }
 }
 
@@ -601,7 +603,7 @@ pub(crate) fn resolve_card_art(p: Painter, rect: Rect, art: &Art<'_>) -> (u32, f
     let _admission = art.motion_identity()
         .map(|id| crate::ui::card_motion::Scope::card(id, p.to_screen(rect).0));
     let image = match art {
-        Art::Texture { image, .. } => image.unwrap_or((0, 0.0, 0.0)),
+        Art::Texture { image, .. } | Art::Scene { image, .. } => image.unwrap_or((0, 0.0, 0.0)),
         Art::Poster(m) => m.map(|m| resolve_tex_wh_on(m.sid, &m.thumb, POSTER_RES.0, POSTER_RES.1, 0)).unwrap_or((0, 0.0, 0.0)),
         Art::Still(m) => m.map(|m| resolve_tex_wh_on(m.sid, still_key(m), STILL_RES.0, STILL_RES.1, 0)).unwrap_or((0, 0.0, 0.0)),
         Art::Thumb { sid, key, res } | Art::Person { sid, key, res } => resolve_tex_wh_on(*sid, key, res.0, res.1, 0),
@@ -621,14 +623,54 @@ pub(crate) fn card(p: Painter, frame: Rect, art: Art, rad: f32, focused: bool, s
     card_named(p, frame, art, None, rad, focused, scale, f)
 }
 
-/// Full artwork inside a uniform collection cell, sharing its card material.
-/// Portrait scenes keep their complete composition rather than losing it to a cover crop.
-pub(crate) fn contained_card(p: Painter, frame: Rect, image: Option<(u32, f32, f32)>, rad: f32, lift: f32) {
+/// Both scene grids and shelves use the ordinary card material, with one outer
+/// rounded outline. Only materially different source aspects need a blurred still.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scene_card(p: Painter, frame: Rect, image: Option<(u32, f32, f32)>,
+    background: Option<(u32, f32, f32)>, aspect: Option<f32>, rad: f32, lift: f32) {
     if p.is_recording() { return; }
+    let Some((texture, width, height)) = image.filter(|(t, w, h)| *t != 0 && *w > 0. && *h > 0.) else {
+        p.rrect_sheened(frame, rad, theme::CARD_PLACEHOLDER); return;
+    };
+    // Decoded artwork dimensions own foreground geometry: file metadata can differ
+    // from a server-cropped screenshot or preview and must never stretch that texture.
+    let ratio = width / height;
+    if scene_aspect_is_standard(ratio) && aspect.is_none_or(scene_aspect_is_standard) {
+        p.tex_carded(texture, frame.cover_uv(width, height, crate::ui::Crop::Centre), frame, rad, theme::TINT_WHITE, lift);
+        return;
+    }
+    let foreground = contain_frame(frame, ratio, 1.);
+    let (back_tex, back_w, back_h) = background.filter(|(t, w, h)| *t != 0 && *w > 0. && *h > 0.)
+        .unwrap_or((0, width, height));
+    if back_tex != 0 && p.scene_card(texture, back_tex, frame.cover_uv(back_w, back_h, crate::ui::Crop::Centre),
+        frame, (foreground.w * 0.5, foreground.h * 0.5), rad, lift) { return; }
+    // Pending blur or unavailable optional program: preserve the complete still/preview.
+    // The foreground has no inner rounding. Until the blur arrives, a conservative
+    // inset keeps its straight edges away from the outer card's rounded corners.
     p.rrect_sheened(frame, rad, theme::CARD_PLACEHOLDER);
-    let Some((texture, width, height)) = image.filter(|(t, w, h)| *t != 0 && *w > 0. && *h > 0.) else { return };
-    let image_frame = contain_frame(frame, width, height);
-    p.tex_carded(texture, crate::gfx::UV_FULL, image_frame, rad.min(image_frame.w * 0.5), theme::TINT_WHITE, lift);
+    let foreground = if foreground.w > frame.w - 2. * rad && foreground.h > frame.h - 2. * rad {
+        contain_frame(frame.inset(rad), ratio, 1.)
+    } else { foreground };
+    p.tex(texture, foreground, 0., theme::TINT_WHITE);
+}
+
+pub(crate) fn scene_aspect_is_standard(aspect: f32) -> bool {
+    aspect.is_finite() && aspect > 0. && (aspect / (16. / 9.) - 1.).abs() <= 0.01
+}
+
+/// Optional focused metadata, independent of provider types and rating scales.
+pub(crate) fn scene_caption(base: &str, duration_seconds: Option<f64>, rating100: Option<i32>) -> String {
+    let mut parts = Vec::new();
+    if !base.is_empty() { parts.push(base.to_owned()); }
+    if let Some(duration) = duration_seconds.filter(|v| v.is_finite() && *v >= 0.) {
+        let seconds = duration.min(u32::MAX as f64).floor() as u32;
+        parts.push(if seconds >= 3600 { format!("{}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60) }
+            else { format!("{}:{:02}", seconds / 60, seconds % 60) });
+    }
+    if let Some(rating) = rating100.filter(|v| (0..=100).contains(v)) {
+        parts.push(format!("★ {:.1}", rating as f32 / 20.));
+    }
+    parts.join(" · ")
 }
 
 pub(crate) fn contain_frame(frame: Rect, width: f32, height: f32) -> Rect {
@@ -652,6 +694,9 @@ pub(crate) fn card_named(p: Painter, frame: Rect, art: Art, name: Option<&str>, 
     // screen nor its springs can forget to report a new positional expression.
     let image = resolve_card_art(p, r, &art);
     match art {
+        Art::Scene { background, aspect_ratio, .. } => {
+            scene_card(p, r, Some(image), background, aspect_ratio, rad, f);
+        }
         Art::Texture { .. } => {
             let (t, tw, th) = image;
             if t != 0 {
@@ -7440,6 +7485,8 @@ impl View for Button {
 // centred bold CAPTION label; width hugs the label with a floor so short tags (CC) still read as a
 // chip. Returns the drawn width so callers can flow chips inline. ----
 pub(crate) enum BadgeStyle {
+    /// Translucent glass material without a live backdrop capture.
+    Translucent,
     /// 2px border + knockout interior: label in `col`, ring in `border`, interior filled `bg` (the
     /// surface behind the chip — keeps the outline clean over a light focus pill or a dark panel).
     ///
@@ -7638,6 +7685,11 @@ pub(crate) fn badge(
                 bg,
             );
             col
+        }
+        BadgeStyle::Translucent => {
+            p.rect_rimmed(r,r.h*0.5,theme::BADGE_FILL,theme::BADGE_FILL,
+                theme::GLASS_RIM,theme::GLASS_RIM_LIGHT[3]-theme::GLASS_RIM[3]);
+            theme::TEXT_PRIMARY
         }
         BadgeStyle::Filled => {
             p.rrect(r, 7.0, 7.0, theme::BADGE_FILL);
@@ -7899,3 +7951,35 @@ mod hero_scrim_tests;
 #[cfg(test)]
 #[path = "widgets_art_crop_tests.rs"]
 mod art_crop_tests;
+
+#[cfg(test)]
+mod scene_card_tests {
+    use super::*;
+    #[test]
+    fn standard_aspect_tolerance_preserves_normal_card_path() {
+        assert!(scene_aspect_is_standard(16. / 9.));
+        assert!(scene_aspect_is_standard(1.78));
+        assert!(!scene_aspect_is_standard(4. / 3.));
+        assert!(!scene_aspect_is_standard(9. / 16.));
+        assert!(!scene_aspect_is_standard(2.35));
+        assert!(!scene_aspect_is_standard(f32::NAN));
+    }
+    #[test]
+    fn nonstandard_source_fits_complete_foreground_inside_one_outer_frame() {
+        let frame = Rect::new(10., 20., 420., 236.);
+        for aspect in [4. / 3., 9. / 16., 2.35] {
+            let foreground = contain_frame(frame, aspect, 1.);
+            assert!((foreground.w / foreground.h - aspect).abs() < 0.001);
+            assert_eq!(foreground.cx(), frame.cx());
+            assert_eq!(foreground.cy(), frame.cy());
+            assert!(foreground.w <= frame.w && foreground.h <= frame.h);
+        }
+    }
+    #[test]
+    fn duration_and_rating_caption_omit_missing_and_do_not_show_denominator() {
+        assert_eq!(scene_caption("", Some(65.), Some(90)), "1:05 · ★ 4.5");
+        assert_eq!(scene_caption("", Some(3661.), None), "1:01:01");
+        assert_eq!(scene_caption("Studio", None, None), "Studio");
+        assert_eq!(scene_caption("", Some(f64::NAN), Some(120)), "");
+    }
+}

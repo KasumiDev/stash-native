@@ -14,6 +14,7 @@ pub struct Scene {
     pub id: String,
     pub title: Option<String>,
     pub date: Option<String>,
+    pub rating100: Option<i32>,
     pub details: Option<String>,
     pub studio: Option<Studio>,
     #[serde(deserialize_with = "null_default")]

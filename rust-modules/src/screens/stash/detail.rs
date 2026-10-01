@@ -5,6 +5,7 @@ use crate::stash::Scene;
 use crate::ui::consts::{MARGIN_X, SCR_W};
 use crate::ui::detail_layout::{self, HERO_TEXT_W, TITLE_BOTTOM};
 use crate::ui::frame::Budget;
+use crate::ui::hero_content;
 use crate::ui::label::{Label, VAlign};
 use crate::ui::machine::*;
 use crate::ui::screen::*;
@@ -20,12 +21,16 @@ const HERO: GroupId = GroupId(0);
 pub struct SceneDetailScreen {
     entry: EntryId,
     content: StashScreen,
+    hero_seated: bool,
+    fresh_entry: bool,
 }
 impl SceneDetailScreen {
     pub fn new(id: String, entry: EntryId) -> Self {
         Self {
             entry,
             content: StashScreen::detail(entry, id),
+            hero_seated: false,
+            fresh_entry: true,
         }
     }
     fn synopsis<'a>(&'a self, cx: &'a Cx<'_, StashHost>) -> TextView<'a> {
@@ -41,7 +46,23 @@ impl SceneDetailScreen {
         .max_lines(3)
     }
     fn chain(&self, cx: &Cx<'_, StashHost>) -> detail_layout::HeroChain {
-        detail_layout::hero_chain(self.synopsis(cx).measure_h(HERO_TEXT_W), false, cx.measure)
+        let mut chain =
+            detail_layout::hero_chain(self.synopsis(cx).measure_h(HERO_TEXT_W), false, cx.measure);
+        if let Some(scene) = self.content.scene() {
+            let tags = self.tags(cx, scene);
+            if !tags.items.is_empty() {
+                chain.btn_y += tags.height() + theme::space::MD;
+            }
+        }
+        chain
+    }
+    fn tags(&self, cx: &Cx<'_, StashHost>, scene: &Scene) -> hero_content::PassiveBadges {
+        let labels = scene
+            .tags
+            .iter()
+            .map(|tag| tag.name.as_str())
+            .collect::<Vec<_>>();
+        hero_content::PassiveBadges::new(&labels, HERO_TEXT_W, cx.measure)
     }
     fn resume(&self) -> bool {
         self.content.scene().is_some_and(|s| s.resume_time > 0.)
@@ -117,7 +138,7 @@ impl SceneDetailScreen {
                 theme::with_a(theme::TEXT_PRIMARY, visible),
             );
         }
-        crate::ui::widgets::hero_scrim(p, visible, !scene.performers.is_empty());
+        crate::ui::widgets::hero_scrim(p, visible, false);
         let y0 = crate::ui::widgets::HERO_BASE_SCRIM_Y0;
         p.rect(
             Rect::new(0., y0, SCR_W, crate::ui::consts::SCR_H - y0),
@@ -130,24 +151,16 @@ impl SceneDetailScreen {
             0.,
         );
         let p = p.alpha(visible);
-        let title = crate::text::elide_by(scene.display_title(), HERO_TEXT_W, false, |s| {
-            f.cx.measure.width_str(s, theme::size::HERO, true)
-        });
-        let title = cs(&title);
-        Label::new(title.as_ptr(), theme::size::HERO, theme::TEXT_PRIMARY)
-            .bold()
-            .v(VAlign::Baseline)
-            .draw(
-                p,
-                Rect::new(
-                    MARGIN_X,
-                    TITLE_BOTTOM
-                        - crate::ui::hero_logo::band_h(crate::ui::hero_logo::LogoRung::Hero)
-                        - scroll,
-                    HERO_TEXT_W,
-                    crate::ui::hero_logo::band_h(crate::ui::hero_logo::LogoRung::Hero),
-                ),
-            );
+        let (title, width) = hero_content::scene_title(scene.display_title(), f.cx.measure);
+        title.draw(
+            p,
+            Rect::new(
+                MARGIN_X,
+                TITLE_BOTTOM - title.measure_h(width) - scroll,
+                width,
+                0.,
+            ),
+        );
         let chain = self.chain(f.cx);
         let metadata = scene.studio.as_ref().map(|s| s.name.as_str()).unwrap_or("");
         line(
@@ -195,27 +208,12 @@ impl SceneDetailScreen {
             theme::size::CAPTION,
             detail_layout::FACTS_INK,
         );
-        let names = scene
-            .performers
-            .iter()
-            .take(detail_layout::PEOPLE_MAX_LINES)
-            .map(|p| p.name.as_str())
-            .collect::<Vec<_>>();
-        let top = detail_layout::people_top(chain.btn_y, names.len()) - scroll;
-        for (index, name) in names.iter().enumerate() {
-            line(
-                p,
-                name,
-                Rect::new(
-                    SCR_W - MARGIN_X - detail_layout::PEOPLE_W,
-                    top + index as f32 * detail_layout::PEOPLE_LEAD,
-                    detail_layout::PEOPLE_W,
-                    detail_layout::PEOPLE_LEAD,
-                ),
-                theme::size::CAPTION,
-                detail_layout::PEOPLE_INK,
-            );
-        }
+        self.tags(f.cx, scene).draw(
+            p,
+            MARGIN_X,
+            chain.facts_y + f.cx.measure.cap_h(theme::size::CAPTION) + theme::space::MD - scroll,
+            f.cx.measure,
+        );
         for &key in self.keys() {
             let Some(rect) = self.rect(key, f.cx) else {
                 continue;
@@ -411,6 +409,7 @@ mod tests {
                     .elem,
                 PLAY
             );
+            assert_eq!(out.iter().filter(|effect|matches!(&effect.fx,Fx::Deliver(_,Delivery::Screen(ScreenEvent::Enter(Enter::Fresh{focus:FocusTarget::Elem(key)}))) if key.elem==PLAY)).count(),1,"Fresh metadata must seat Play exactly once");
             out.clear();
             {
                 let mut fx =
@@ -434,6 +433,84 @@ mod tests {
                     .count(),
                 2
             );
+        });
+    }
+    #[test]
+    fn refreshing_or_restoring_detail_does_not_reseat_hero() {
+        let _lock = crate::testlock::serial();
+        context(|cx| {
+            let metadata = || crate::stores::stash::PageData {
+                scene: Some(Scene {
+                    id: "42".into(),
+                    resume_time: 90.,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let mut screen = SceneDetailScreen::new("42".into(), EntryId(1));
+            let mut out = Vec::new();
+            let mut present = crate::ui::present::Present::new();
+            {
+                let mut fx =
+                    Effects::new(&mut out, MachineId::Instance(InstanceId(1)), &mut present);
+                screen.step(&ScreenEvent::Mount, cx, &mut fx);
+                screen.step(
+                    &ScreenEvent::Async(
+                        RequestId(1),
+                        StashMsg::Loaded {
+                            generation: 1,
+                            result: Ok(metadata()),
+                        },
+                    ),
+                    cx,
+                    &mut fx,
+                );
+            }
+            out.clear();
+            {
+                let mut fx =
+                    Effects::new(&mut out, MachineId::Instance(InstanceId(1)), &mut present);
+                screen.content.retry(&mut fx);
+                screen.step(
+                    &ScreenEvent::Async(
+                        RequestId(2),
+                        StashMsg::Loaded {
+                            generation: 2,
+                            result: Ok(metadata()),
+                        },
+                    ),
+                    cx,
+                    &mut fx,
+                );
+                screen.step(&ScreenEvent::Enter(Enter::Restored), cx, &mut fx);
+            }
+            assert!(!out.iter().any(|effect| matches!(
+                &effect.fx,
+                Fx::Deliver(_, Delivery::Screen(ScreenEvent::Enter(Enter::Fresh { .. })))
+            )));
+            let mut restored = SceneDetailScreen::new("42".into(), EntryId(1));
+            out.clear();
+            {
+                let mut fx =
+                    Effects::new(&mut out, MachineId::Instance(InstanceId(1)), &mut present);
+                restored.step(&ScreenEvent::Mount, cx, &mut fx);
+                restored.step(&ScreenEvent::Enter(Enter::Restored), cx, &mut fx);
+                restored.step(
+                    &ScreenEvent::Async(
+                        RequestId(1),
+                        StashMsg::Loaded {
+                            generation: 1,
+                            result: Ok(metadata()),
+                        },
+                    ),
+                    cx,
+                    &mut fx,
+                );
+            }
+            assert!(!out.iter().any(|effect| matches!(
+                &effect.fx,
+                Fx::Deliver(_, Delivery::Screen(ScreenEvent::Enter(Enter::Fresh { .. })))
+            )));
         });
     }
 }
@@ -470,7 +547,26 @@ impl Machine<StashHost> for SceneDetailScreen {
                 fx.invalidate(crate::ui::present::Provenance::Input);
                 Handled::Yes
             }
-            _ => self.content.step(event, cx, fx),
+            _ => {
+                if matches!(event, ScreenEvent::Enter(Enter::Restored)) {
+                    self.fresh_entry = false;
+                }
+                let handled = self.content.step(event, cx, fx);
+                if !self.hero_seated && self.fresh_entry && self.content.scene().is_some() {
+                    self.hero_seated = true;
+                    self.content.shelf_scroll(0.);
+                    fx.push(Fx::Deliver(
+                        fx.from(),
+                        Delivery::Screen(ScreenEvent::Enter(Enter::Fresh {
+                            focus: FocusTarget::Elem(FocusKey {
+                                entry: self.entry,
+                                elem: PLAY,
+                            }),
+                        })),
+                    ));
+                }
+                handled
+            }
         }
     }
 }
@@ -479,7 +575,7 @@ impl Screen<StashHost> for SceneDetailScreen {
         "scene"
     }
     fn state(&self) -> &dyn LogicalState {
-        self.content.state()
+        self
     }
     fn crumb(&self, cx: &Cx<'_, StashHost>) -> Option<Cow<'_, str>> {
         self.content.crumb(cx)
@@ -509,5 +605,15 @@ impl Screen<StashHost> for SceneDetailScreen {
             self.draw_hero(f, scene);
         }
         self.content.draw(f);
+    }
+}
+impl LogicalState for SceneDetailScreen {
+    fn write(&self, c: &mut Canon) {
+        self.content.state().write(c);
+        c.bool(self.hero_seated).bool(self.fresh_entry);
+    }
+    fn probe(&self, s: &mut String) {
+        self.content.state().probe(s);
+        s.push_str(&format!(" hero-seated={}", self.hero_seated));
     }
 }

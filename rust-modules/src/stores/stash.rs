@@ -49,13 +49,16 @@ pub enum Action {
     SubtitleTrack(i32),
 }
 pub enum StashMsg {
+    ShelfPageLoaded {
+        scope: ShelfScope,
+        id: ShelfId,
+        generation: u32,
+        page: u32,
+        result: Result<ShelfPage, String>,
+    },
     Loaded {
         generation: u32,
         result: Result<PageData, String>,
-    },
-    ShelfLoaded {
-        generation: u32,
-        result: Result<Section, String>,
     },
     PerformerTags {
         generation: u32,
@@ -73,13 +76,80 @@ pub struct Tile {
     pub identity: String,
     pub title: String,
     pub o_count: Option<i64>,
+    pub scene_metadata: Option<SceneCardMetadata>,
     pub caption: String,
     pub image: Option<String>,
     pub preview: Option<String>,
     pub action: Action,
 }
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SceneCardMetadata {
+    pub duration_seconds: Option<f64>,
+    pub rating100: Option<i32>,
+    pub aspect_ratio: Option<f32>,
+}
+impl From<&Scene> for SceneCardMetadata {
+    fn from(scene: &Scene) -> Self {
+        let file = scene.files.first();
+        Self {
+            duration_seconds: file
+                .map(|f| f.duration)
+                .filter(|d| d.is_finite() && *d > 0.),
+            rating100: scene.rating100.filter(|r| (0..=100).contains(r)),
+            aspect_ratio: file
+                .filter(|f| f.width > 0 && f.height > 0)
+                .map(|f| f.width as f32 / f.height as f32),
+        }
+    }
+}
+pub const SHELF_PAGE_SIZE: u32 = 50;
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ShelfId {
+    Favorites,
+    Tag(String),
+}
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ShelfScope {
+    Home,
+    Performer(String),
+    Tag(String),
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShelfSpec {
+    pub id: ShelfId,
+    pub title: String,
+    pub scope: ShelfScope,
+}
+impl ShelfSpec {
+    pub fn query(&self, page: u32) -> Query {
+        let mut q = Query {
+            page: page.max(1),
+            per_page: SHELF_PAGE_SIZE,
+            sort: "date".into(),
+            direction: Direction::Descending,
+            ..Default::default()
+        };
+        match &self.scope {
+            ShelfScope::Home => {}
+            ShelfScope::Performer(id) => q.performer_id = Some(id.clone()),
+            ShelfScope::Tag(id) => q.tag_id = Some(id.clone()),
+        }
+        match &self.id {
+            ShelfId::Favorites => q.rating100 = Some(100),
+            ShelfId::Tag(id) => q.tag_ids.push(id.clone()),
+        }
+        q
+    }
+}
+#[derive(Clone, Debug)]
+pub struct ShelfPage {
+    pub count: usize,
+    pub has_more: bool,
+    pub section: Section,
+}
 #[derive(Clone, Debug)]
 pub struct Section {
+    pub shelf_id: Option<ShelfId>,
     pub title: String,
     pub tiles: Vec<Tile>,
     pub portrait: bool,
@@ -97,24 +167,21 @@ pub struct PageData {
     pub has_more: bool,
     pub images: Vec<Image>,
     pub lazy_tags: Vec<Tag>,
+    pub shelves: Vec<ShelfSpec>,
     pub performer: Option<Performer>,
     /// Calendar date captured by the query worker, so screens never read a wall clock.
     pub reference_date: Option<(i32, u32, u32)>,
     pub shelves_error: Option<String>,
 }
 pub enum Work {
+    ShelfPage {
+        spec: ShelfSpec,
+        generation: u32,
+        page: u32,
+    },
     PerformerTags {
         performer_id: String,
         page: u32,
-        generation: u32,
-    },
-    PerformerTagShelf {
-        performer_id: String,
-        tag: Tag,
-        generation: u32,
-    },
-    TagShelf {
-        tag: Tag,
         generation: u32,
     },
     Load {
@@ -140,6 +207,36 @@ impl Worker {
                 let mut config = config;
                 while let Ok((addr, job)) = jobs.recv() {
                     let msg = match job {
+                        Work::ShelfPage {
+                            spec,
+                            generation,
+                            page,
+                        } => {
+                            let result = if fixtures {
+                                Ok(fixture_shelf(&spec, page))
+                            } else {
+                                Client::new(config.clone()).map_err(err).and_then(|c| {
+                                    let q = spec.query(page);
+                                    c.scenes(&q)
+                                        .map(|p| ShelfPage {
+                                            count: p.count,
+                                            has_more: page_has_more(&q, p.count),
+                                            section: identified_shelf(
+                                                &spec,
+                                                p.items.into_iter().map(scene).collect(),
+                                            ),
+                                        })
+                                        .map_err(err)
+                                })
+                            };
+                            StashMsg::ShelfPageLoaded {
+                                scope: spec.scope,
+                                id: spec.id,
+                                generation,
+                                page,
+                                result,
+                            }
+                        }
                         Work::PerformerTags {
                             performer_id,
                             page,
@@ -170,60 +267,6 @@ impl Worker {
                                     c.performer_scene_tags(&performer_id, page).map_err(err)
                                 })
                             },
-                        },
-                        Work::PerformerTagShelf {
-                            performer_id,
-                            tag,
-                            generation,
-                        } => StashMsg::ShelfLoaded {
-                            generation,
-                            result: if fixtures {
-                                let data = fixture(&StashArg::Scenes, &Query::default());
-                                Ok(shelf(
-                                    &tag.name,
-                                    data.sections
-                                        .into_iter()
-                                        .flat_map(|s| s.tiles)
-                                        .take(12)
-                                        .collect(),
-                                ))
-                            } else {
-                                Client::new(config.clone()).map_err(err).and_then(|c| {
-                                    let q = Query {
-                                        performer_id: Some(performer_id),
-                                        tag_id: Some(tag.id),
-                                        sort: "date".into(),
-                                        direction: Direction::Descending,
-                                        per_page: 12,
-                                        ..Default::default()
-                                    };
-                                    c.scenes(&q)
-                                        .map(|p| {
-                                            shelf(
-                                                &tag.name,
-                                                p.items.into_iter().map(scene).collect(),
-                                            )
-                                        })
-                                        .map_err(err)
-                                })
-                            },
-                        },
-                        Work::TagShelf { tag, generation } => StashMsg::ShelfLoaded {
-                            generation,
-                            result: Client::new(config.clone()).map_err(err).and_then(|c| {
-                                let q = Query {
-                                    tag_id: Some(tag.id),
-                                    sort: "date".into(),
-                                    direction: Direction::Descending,
-                                    per_page: 12,
-                                    ..Default::default()
-                                };
-                                c.scenes(&q)
-                                    .map(|p| {
-                                        shelf(&tag.name, p.items.into_iter().map(scene).collect())
-                                    })
-                                    .map_err(err)
-                            }),
                         },
                         Work::Load {
                             route,
@@ -295,13 +338,14 @@ fn fixture(route: &StashArg, query: &Query) -> PageData {
     let scenes: Vec<_> = (1..=if paged { 120 } else { 12 })
         .map(|id| Scene {
             id: id.to_string(),
-            title: Some(format!("Scene {id}")),
+            title: Some(if id == 2 { "A very long synthetic scene title with enough words to verify the first line wraps at half the screen and the second uses more space before the remaining overflow is ellipsized".into() } else { format!("Scene {id}") }),
             date: Some("2026-09-01".into()),
             details: Some("A synthetic scene for checking the shared movie detail layout, navigation, and playback controls.".into()),
             studio: Some(crate::stash::Studio { id: "fixture".into(), name: "Fixture Studio".into() }),
-            files: vec![crate::stash::SceneFile { duration: 1560., width: if id % 3 == 0 { 1080 } else { 1920 }, height: if id % 3 == 0 { 1920 } else { 1080 }, video_codec: "h264".into(), audio_codec: "aac".into(), format: "mp4".into() }],
+            files: vec![crate::stash::SceneFile { duration: 1560., width: if id % 7 == 0 { 3840 } else if id % 5 == 0 || id % 3 == 0 { 1080 } else { 1920 }, height: if id % 3 == 0 && id % 5 != 0 && id % 7 != 0 { 1920 } else { 1080 }, video_codec: "h264".into(), audio_codec: "aac".into(), format: "mp4".into() }],
             resume_time: if id == 1 { 120. } else { 0. },
             o_counter: id,
+            rating100: if id % 4 == 0 { Some(100) } else if id % 7 == 0 { None } else { Some(90) },
             paths: crate::stash::ScenePaths {
                 screenshot: Some(format!("fixture://scene/{id}")),
                 ..Default::default()
@@ -336,6 +380,16 @@ fn fixture(route: &StashArg, query: &Query) -> PageData {
         count: 12,
         ..Default::default()
     };
+    let shelf_scope = match route {
+        StashArg::Home => Some(ShelfScope::Home),
+        StashArg::Performer(id) => Some(ShelfScope::Performer(id.clone())),
+        StashArg::Tag(id) => Some(ShelfScope::Tag(id.clone())),
+        _ => None,
+    };
+    if let Some(scope) = shelf_scope {
+        data.shelves = shelf_specs(scope, &tags);
+        data.lazy_tags = tags.clone();
+    }
     if matches!(route, StashArg::Scenes | StashArg::Search) {
         data.scenes = scenes.clone();
     }
@@ -351,11 +405,6 @@ fn fixture(route: &StashArg, query: &Query) -> PageData {
                 "Performers",
                 performers.clone().into_iter().map(performer).collect(),
                 true,
-            ));
-            data.sections.push(section(
-                "Tag 1",
-                scenes.into_iter().map(scene).collect(),
-                false,
             ));
         }
         StashArg::Scenes | StashArg::Search => data.sections.push(section(
@@ -421,6 +470,7 @@ fn fixture(route: &StashArg, query: &Query) -> PageData {
                         identity: "play".into(),
                         title: "Play from beginning".into(),
                         o_count: None,
+                        scene_metadata: None,
                         caption: String::new(),
                         image: scene.paths.screenshot.clone(),
                         preview: None,
@@ -430,6 +480,7 @@ fn fixture(route: &StashArg, query: &Query) -> PageData {
                         identity: "resume".into(),
                         title: "Resume".into(),
                         o_count: None,
+                        scene_metadata: None,
                         caption: String::new(),
                         image: scene.paths.screenshot.clone(),
                         preview: None,
@@ -458,6 +509,7 @@ fn fixture(route: &StashArg, query: &Query) -> PageData {
                         identity: format!("image:{}", image.id),
                         title: image.title.unwrap_or_default(),
                         o_count: None,
+                        scene_metadata: None,
                         caption: String::new(),
                         image: image.paths.image,
                         preview: None,
@@ -517,6 +569,7 @@ fn fixture(route: &StashArg, query: &Query) -> PageData {
     data
 }
 fn scene(s: Scene) -> Tile {
+    let metadata = SceneCardMetadata::from(&s);
     Tile {
         identity: format!("scene:{}", s.id),
         title: s
@@ -525,6 +578,7 @@ fn scene(s: Scene) -> Tile {
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| format!("Scene {}", s.id)),
         o_count: Some(s.o_counter),
+        scene_metadata: Some(metadata),
         caption: s.date.unwrap_or_else(|| "Undated".into()),
         image: s.paths.screenshot.clone(),
         preview: s.paths.preview.clone(),
@@ -536,7 +590,12 @@ fn performer(p: Performer) -> Tile {
         identity: format!("performer:{}", p.id),
         title: p.name,
         o_count: Some(p.o_counter),
-        caption: if p.favorite { "★".into() } else { String::new() },
+        scene_metadata: None,
+        caption: if p.favorite {
+            "★".into()
+        } else {
+            String::new()
+        },
         image: p.image_path,
         preview: None,
         action: Action::Open(StashArg::Performer(p.id)),
@@ -547,6 +606,7 @@ fn gallery(g: Gallery) -> Tile {
         identity: format!("gallery:{}", g.id),
         title: g.title.unwrap_or_else(|| format!("Gallery {}", g.id)),
         o_count: None,
+        scene_metadata: None,
         caption: format!("{} images", g.image_count),
         image: g.cover.and_then(|i| i.paths.thumbnail.or(i.paths.image)),
         preview: None,
@@ -558,6 +618,7 @@ fn tag(t: Tag) -> Tile {
         identity: format!("tag:{}", t.id),
         title: t.name,
         o_count: None,
+        scene_metadata: None,
         caption: if t.favorite {
             "★".into()
         } else {
@@ -570,10 +631,17 @@ fn tag(t: Tag) -> Tile {
 }
 fn section(title: &str, tiles: Vec<Tile>, portrait: bool) -> Section {
     Section {
+        shelf_id: None,
         title: title.into(),
         tiles,
         portrait,
         shelf: false,
+    }
+}
+fn identified_shelf(spec: &ShelfSpec, tiles: Vec<Tile>) -> Section {
+    Section {
+        shelf_id: Some(spec.id.clone()),
+        ..shelf(&spec.title, tiles)
     }
 }
 fn shelf(title: &str, tiles: Vec<Tile>) -> Section {
@@ -682,6 +750,7 @@ fn load(c: &Client, r: &StashArg, q: &Query) -> Result<PageData, String> {
                         identity: "play".into(),
                         title: "Play from beginning".into(),
                         o_count: None,
+                        scene_metadata: None,
                         caption: String::new(),
                         image: s.paths.screenshot.clone(),
                         preview: None,
@@ -695,6 +764,7 @@ fn load(c: &Client, r: &StashArg, q: &Query) -> Result<PageData, String> {
                             s.resume_time % 60.
                         ),
                         o_count: None,
+                        scene_metadata: None,
                         caption: String::new(),
                         image: s.paths.screenshot.clone(),
                         preview: None,
@@ -731,6 +801,12 @@ fn load(c: &Client, r: &StashArg, q: &Query) -> Result<PageData, String> {
             } else {
                 out.title = c.tag(id).map_err(err)?.name;
                 query.tag_id = Some(id.clone());
+                if q.page == 1 {
+                    match favorite_tags(c) {
+                        Ok(tags) => out.lazy_tags = tags,
+                        Err(error) => out.shelves_error = Some(error),
+                    }
+                }
             }
             let scenes = c.scenes(&query).map_err(err)?;
             let galleries = c.galleries(&query).map_err(err)?;
@@ -771,6 +847,7 @@ fn load(c: &Client, r: &StashArg, q: &Query) -> Result<PageData, String> {
                     identity: format!("image:{}", i.id),
                     title: i.title.unwrap_or_else(|| format!("Image {}", index + 1)),
                     o_count: None,
+                    scene_metadata: None,
                     caption: String::new(),
                     image: i.paths.thumbnail.or(i.paths.image),
                     preview: None,
@@ -783,6 +860,17 @@ fn load(c: &Client, r: &StashArg, q: &Query) -> Result<PageData, String> {
             out.sections.push(section("Images", tiles, false));
         }
         StashArg::Settings | StashArg::Player(_) => {}
+    }
+    if q.page == 1 {
+        let scope = match r {
+            StashArg::Home => Some(ShelfScope::Home),
+            StashArg::Performer(id) => Some(ShelfScope::Performer(id.clone())),
+            StashArg::Tag(id) => Some(ShelfScope::Tag(id.clone())),
+            _ => None,
+        };
+        if let Some(scope) = scope {
+            out.shelves = shelf_specs(scope, &out.lazy_tags);
+        }
     }
     Ok(out)
 }
@@ -817,9 +905,247 @@ fn favorite_tags(c: &Client) -> Result<Vec<Tag>, String> {
     Ok(tags)
 }
 
+/// Stable shelf IDs and filters are data-layer facts, independent of display names.
+pub fn shelf_specs(scope: ShelfScope, tags: &[Tag]) -> Vec<ShelfSpec> {
+    let mut favorite: Vec<_> = tags
+        .iter()
+        .filter(|t| t.favorite)
+        .filter(|t| !matches!(&scope,ShelfScope::Tag(id) if id == &t.id))
+        .collect();
+    favorite.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let mut seen = std::collections::HashSet::new();
+    favorite.retain(|t| seen.insert(t.id.clone()));
+    let mut shelves = Vec::new();
+    if !matches!(scope, ShelfScope::Home) {
+        shelves.push(ShelfSpec {
+            id: ShelfId::Favorites,
+            title: "Favorites".into(),
+            scope: scope.clone(),
+        });
+    }
+    shelves.extend(favorite.into_iter().map(|t| ShelfSpec {
+        id: ShelfId::Tag(t.id.clone()),
+        title: t.name.clone(),
+        scope: scope.clone(),
+    }));
+    shelves
+}
+
+pub fn fixture_shelf(spec: &ShelfSpec, page: u32) -> ShelfPage {
+    // A deterministic fixture exceeding one page; favorites include rated-100 scenes only.
+    let source: Vec<_> = (1..=123)
+        .map(|id| Scene {
+            id: id.to_string(),
+            title: Some(format!("Scene {id}")),
+            date: if id > 120 {
+                None
+            } else {
+                Some(format!("2026-09-{:02}", 28 - (id % 28)))
+            },
+            rating100: if id % 3 == 0 {
+                None
+            } else {
+                Some(if id % 2 == 0 { 100 } else { 80 })
+            },
+            performers: vec![Performer {
+                id: "1".into(),
+                name: "Fixture performer".into(),
+                ..Default::default()
+            }],
+            tags: vec![
+                Tag {
+                    id: "1".into(),
+                    name: "Alpha".into(),
+                    favorite: true,
+                    ..Default::default()
+                },
+                Tag {
+                    id: if id % 2 == 0 { "2" } else { "3" }.into(),
+                    name: "Other".into(),
+                    favorite: true,
+                    ..Default::default()
+                },
+            ],
+            files: vec![crate::stash::SceneFile {
+                duration: 90. + id as f64,
+                width: 1920,
+                height: 1080,
+                ..Default::default()
+            }],
+            paths: crate::stash::ScenePaths {
+                screenshot: Some(format!("fixture://scene/{id}")),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .collect();
+    fixture_shelf_from(spec, page, source)
+}
+
+fn fixture_shelf_from(spec: &ShelfSpec, page: u32, source: Vec<Scene>) -> ShelfPage {
+    let q = spec.query(page);
+    let mut tags = q.tag_ids.clone();
+    tags.extend(q.tag_id.iter().cloned());
+    let mut seen = std::collections::HashSet::new();
+    let mut scenes: Vec<_> = source
+        .into_iter()
+        .filter(|s| {
+            q.rating100.is_none_or(|r| s.rating100 == Some(r))
+                && q.performer_id
+                    .as_ref()
+                    .is_none_or(|id| s.performers.iter().any(|p| &p.id == id))
+                && tags.iter().all(|id| s.tags.iter().any(|t| &t.id == id))
+                && seen.insert(s.id.clone())
+        })
+        .collect();
+    scenes.sort_by(|a, b| b.date.cmp(&a.date).then_with(|| a.id.cmp(&b.id)));
+    let count = scenes.len();
+    let offset = (q.page - 1) as usize * SHELF_PAGE_SIZE as usize;
+    let tiles = scenes
+        .into_iter()
+        .skip(offset)
+        .take(SHELF_PAGE_SIZE as usize)
+        .map(scene)
+        .collect();
+    ShelfPage {
+        count,
+        has_more: page_has_more(&q, count),
+        section: identified_shelf(spec, tiles),
+    }
+}
+
 #[cfg(test)]
 mod pagination_tests {
     use super::*;
+    #[test]
+    fn shelf_pages_preserve_identity_and_continue_after_fifty() {
+        let spec = ShelfSpec {
+            id: ShelfId::Tag("1".into()),
+            title: "Alpha".into(),
+            scope: ShelfScope::Home,
+        };
+        let first = fixture_shelf(&spec, 1);
+        let second = fixture_shelf(&spec, 2);
+        let last = fixture_shelf(&spec, 3);
+        assert_eq!(
+            (first.count, first.section.tiles.len(), first.has_more),
+            (123, 50, true)
+        );
+        assert_eq!((second.section.tiles.len(), second.has_more), (50, true));
+        assert_eq!((last.section.tiles.len(), last.has_more), (23, false));
+        assert_eq!(first.section.shelf_id, Some(spec.id));
+        let mut ids = std::collections::HashSet::new();
+        assert!(first
+            .section
+            .tiles
+            .iter()
+            .chain(&second.section.tiles)
+            .chain(&last.section.tiles)
+            .all(|t| ids.insert(&t.identity)));
+        assert!(last
+            .section
+            .tiles
+            .iter()
+            .rev()
+            .take(3)
+            .all(|t| t.caption == "Undated"));
+    }
+    #[test]
+    fn tag_shelves_use_intersection_and_favorites_are_rating_only() {
+        let spec = ShelfSpec {
+            id: ShelfId::Tag("2".into()),
+            title: "Other".into(),
+            scope: ShelfScope::Tag("1".into()),
+        };
+        let page = fixture_shelf(&spec, 1);
+        assert_eq!(page.count, 61);
+        let favorites = ShelfSpec {
+            id: ShelfId::Favorites,
+            title: "Favorites".into(),
+            scope: ShelfScope::Performer("1".into()),
+        };
+        let page = fixture_shelf(&favorites, 1);
+        assert!(page
+            .section
+            .tiles
+            .iter()
+            .all(|t| t.scene_metadata.as_ref().unwrap().rating100 == Some(100)));
+        assert_eq!(page.count, 41);
+        let empty = ShelfSpec {
+            scope: ShelfScope::Performer("missing".into()),
+            ..favorites
+        };
+        assert_eq!(fixture_shelf(&empty, 1).count, 0);
+    }
+    #[test]
+    fn stable_specs_exclude_viewed_tag_and_sort_favorites_alphabetically() {
+        let tags = vec![
+            Tag {
+                id: "self".into(),
+                name: "A".into(),
+                favorite: true,
+                ..Default::default()
+            },
+            Tag {
+                id: "z".into(),
+                name: "Zulu".into(),
+                favorite: true,
+                ..Default::default()
+            },
+            Tag {
+                id: "b".into(),
+                name: "Beta".into(),
+                favorite: true,
+                ..Default::default()
+            },
+            Tag {
+                id: "hidden".into(),
+                name: "Hidden".into(),
+                favorite: false,
+                ..Default::default()
+            },
+        ];
+        let specs = shelf_specs(ShelfScope::Tag("self".into()), &tags);
+        assert_eq!(
+            specs.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            vec![
+                ShelfId::Favorites,
+                ShelfId::Tag("b".into()),
+                ShelfId::Tag("z".into())
+            ]
+        );
+        let q = specs[1].query(2);
+        assert_eq!(q.per_page, 50);
+        assert_eq!(q.tag_id.as_deref(), Some("self"));
+        assert_eq!(q.tag_ids, vec!["b"]);
+    }
+    #[test]
+    fn missing_rating_and_invalid_media_dimensions_are_not_fabricated() {
+        let scene = Scene {
+            files: vec![crate::stash::SceneFile {
+                duration: f64::NAN,
+                width: 1920,
+                height: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            SceneCardMetadata::from(&scene),
+            SceneCardMetadata::default()
+        );
+        let spec = ShelfSpec {
+            id: ShelfId::Favorites,
+            title: "Favorites".into(),
+            scope: ShelfScope::Home,
+        };
+        assert_eq!(fixture_shelf_from(&spec, 1, vec![scene]).count, 0);
+    }
     #[test]
     fn reference_date_is_a_replayable_worker_fact() {
         assert_eq!(

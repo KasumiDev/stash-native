@@ -190,7 +190,7 @@ impl MediaManager {
                     self.budget.clone(),
                     self.active.clone(),
                     crate::imgcache::classify_stash(&self.cache_namespace, url,
-                        if key.starts_with("blur:") { "blur-1280x720-v1" } else { "contain-1280x720-v1" }),
+                        still_transform(key)),
                 ) {
                     self.jobs.insert(key.clone(), job);
                 }
@@ -628,6 +628,14 @@ fn append_asset_chunk(bytes: &mut Vec<u8>, chunk: &[u8], reserved: usize) -> boo
     bytes.extend_from_slice(chunk);
     true
 }
+fn still_transform(key: &str) -> &'static str {
+    if key.starts_with("blur:scene:") { "scene-blur-320x180-v1" }
+    else if key.starts_with("blur:") { "blur-1280x720-v1" }
+    else { "contain-1280x720-v1" }
+}
+fn still_bounds(key: &str) -> (u32, u32) {
+    if key.starts_with("blur:scene:") { (320, 180) } else { (1280, 720) }
+}
 fn static_frame(
     key: &str,
     bytes: &[u8],
@@ -646,20 +654,22 @@ fn static_frame(
     reader.limits(limits);
     let decoder = reader.into_decoder().ok()?;
     let (width, height) = decoder.dimensions();
-    let thumb_pixels = (width.min(1280) as usize).checked_mul(height.min(720) as usize)?;
+    let (limit_width, limit_height) = still_bounds(key);
+    let thumb_pixels = (width.min(limit_width) as usize).checked_mul(height.min(limit_height) as usize)?;
     // Reserve decoded pixels, codec working storage and thumbnail/conversion/output buffers
     // before read_image can allocate. Small images pay their actual dimensions, not 16 MiB.
     let working = usize::try_from(decoder.total_bytes())
         .ok()?
         .checked_mul(2)?
         .checked_add(
-            thumb_pixels.checked_mul(decoder.color_type().bytes_per_pixel() as usize + 8)?,
+            thumb_pixels.checked_mul(decoder.color_type().bytes_per_pixel() as usize + if key.starts_with("blur:") { 24 } else { 8 })?,
         )?;
     let mut allocation = reserve_or_retry(budget, working, blocked)?;
     let image = image::DynamicImage::from_decoder(decoder).ok()?;
-    let thumb = image.thumbnail(width.min(1280), height.min(720));
+    let thumb = image.thumbnail(width.min(limit_width), height.min(limit_height));
     drop(image);
-    let thumb = if key.starts_with("blur:") { thumb.blur(24.) } else { thumb };
+    let thumb = if key.starts_with("blur:scene:") { thumb.blur(12.) }
+        else if key.starts_with("blur:") { thumb.blur(24.) } else { thumb };
     let rgba = thumb.into_rgba8();
     let (output_width, output_height) = rgba.dimensions();
     let pixels = rgba.into_raw();
@@ -845,6 +855,24 @@ mod tests {
         )
         .unwrap();
         bytes
+    }
+    #[test]
+    fn scene_blur_is_small_static_and_releases_its_reservation() {
+        let source = image::RgbaImage::from_fn(640, 360, |x, y| {
+            let white = ((x / 8 + y / 8) % 2) as u8 * 255;
+            image::Rgba([white, white, white, 255])
+        });
+        let mut bytes = Vec::new();
+        image::ImageEncoder::write_image(image::codecs::png::PngEncoder::new(&mut bytes),
+            source.as_raw(), source.width(), source.height(), image::ExtendedColorType::Rgba8).unwrap();
+        let budget = Arc::new(AtomicUsize::new(0));
+        let frame = static_frame("blur:scene:1", &bytes, &budget, &AtomicBool::new(false)).unwrap();
+        assert_eq!((frame.width, frame.height), (320, 180));
+        assert!(frame.rgba.chunks_exact(4).any(|pixel| pixel[0] > 0 && pixel[0] < 255));
+        assert_eq!(budget.load(Ordering::Acquire), frame.rgba.capacity());
+        assert_ne!(still_transform("blur:scene:1"), still_transform("scene:1"));
+        drop(frame);
+        assert_eq!(budget.load(Ordering::Acquire), 0);
     }
     #[test]
     fn understated_content_length_cannot_grow_encoded_buffer() {

@@ -37,6 +37,7 @@ pub(crate) mod detail_layout;
 pub(crate) mod dispatch; // RESTRUCTURE spike (spec §3.3): the one frame algorithm, generic over `machine::Host`
 pub(crate) mod adapters; // RESTRUCTURE (spec §2.2): the one door out of the machine world, and its test stub
 pub(crate) mod geom; // RESTRUCTURE (spec §7.1): `Focusable` for the widgets — geometry IS `place`
+pub(crate) mod hero_content;
 pub(crate) mod tile; // RESTRUCTURE (spec §10): the library's item abstraction for a shelf tile
 pub(crate) mod document_reader;
 pub(crate) mod fixture; // RESTRUCTURE spike: `FixtureHost` — the bundle the generic library is tested against
@@ -1118,6 +1119,26 @@ impl Painter {
             f,
             dy,
         );
+    }
+    /// Shared two-layer scene card, with one rounded outline and focus material.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn scene_card(self, foreground: u32, background: u32, uv: [f32; 4],
+        r: Rect, halfsize: (f32, f32), rad: f32, f: f32) -> bool {
+        let (blur, _, sa, off_l) = card_shadow_params(r.h, f, theme::CARD_SHADOW[3]);
+        let dy = f.clamp(0., 1.) * off_l;
+        let pad = blur + dy + 1.;
+        if self.declare(Rect::new(r.x - pad, r.y - pad, r.w + 2. * pad, r.h + 2. * pad), 65, |data| {
+            use frame::backdrop::Value;
+            foreground.record(data); crate::gfx::tex_ledger::revision(foreground).record(data);
+            background.record(data); crate::gfx::tex_ledger::revision(background).record(data);
+            uv.record(data); halfsize.0.record(data); halfsize.1.record(data); rad.record(data); f.record(data);
+        }) { return true; }
+        if self.text_recorder { return true; }
+        let tint = self.c(theme::TINT_WHITE);
+        let shadow = self.c(theme::with_a(theme::CARD_SHADOW, sa));
+        crate::gfx::draw_scene_card(foreground, background, uv, r.x + self.dx, r.y + self.dy,
+            r.w, r.h, halfsize, rad, tint.as_ptr(), theme::CARD_SHEEN_W,
+            self.sheen_rim().as_ptr(), pad, blur, shadow.as_ptr(), f, dy)
     }
     /// The still specialization composes the label ground with the artwork. A fade or unsupported
     /// shader returns false so the component can retain its ordinary card and ground passes.

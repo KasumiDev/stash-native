@@ -146,6 +146,8 @@ const FS_STILL: &CStr = glsl!("shaders/fs_img.frag", "#define PLX_STILL_GROUND\n
 /// [`IPROG`] with the plain look if it fails to link, same as [`STILL_IMAGE`]'s own fallback.
 const VS_FOCUS: &CStr = glsl!("shaders/vs_img.vert", "#define PLX_FOCUS\n");
 const FS_FOCUS: &CStr = glsl!("shaders/fs_img.frag", "#define PLX_FOCUS\n");
+const FS_SCENE: &CStr = glsl!("shaders/fs_img.frag", "#define PLX_SCENE_CARD\n");
+const FS_SCENE_FOCUS: &CStr = glsl!("shaders/fs_img.frag", "#define PLX_SCENE_CARD\n#define PLX_FOCUS\n");
 const FS_HERO: &CStr = glsl!("shaders/fs_hero.frag");
 /// The wash with its photograph dissolved into it (`draw_art_wash`): dithered, because the wash it
 /// carries always dithers, over `vs_ambient.vert`'s field mesh so its colour is the wash's own
@@ -660,6 +662,8 @@ static mut STILL_IMAGE: Option<(c_uint, ImageUniforms, c_int, c_int)> = None;
 /// Optional FOCUSED-card specialization ([`VS_FOCUS`]/[`FS_FOCUS`]) — [`IPROG`] remains the
 /// fallback (the plain look, same as before this program existed) if this fails to link.
 static mut FOCUS_IMAGE: Option<(c_uint, ImageUniforms)> = None;
+/// Plain/focused two-texture scene cards, leaving every ordinary image program unchanged.
+static mut SCENE_IMAGES: [Option<(c_uint, ImageUniforms, c_int)>; 2] = [None; 2];
 // ---- hero-ground program: the backdrop art with both scrim fields folded into it (fs_hero.frag).
 // Its own program because it is the SAME quad the art already draws, only carrying two more
 // closed-form fields — nothing else in the app wants them, and the card composite must not pay for
@@ -1846,6 +1850,23 @@ pub(crate) fn init_image() {
             log("focus image prog unavailable — focused cards keep the plain look");
         }
 
+        for (index, (vertex, fragment)) in [(VS_IMG, FS_SCENE), (VS_FOCUS, FS_SCENE_FOCUS)].into_iter().enumerate() {
+            SCENE_IMAGES[index] = link_optional_program(vertex.as_ptr(), fragment.as_ptr()).map(|program| {
+                let loc = |name: &CStr| glGetUniformLocation(program, name.as_ptr());
+                let uniforms = ImageUniforms {
+                    rect: loc(c"u_trect"), tint: loc(c"u_tint"), uvrect: loc(c"u_uvrect"),
+                    card: loc(c"u_card"), rimw: loc(c"u_rimw"), rimcol: loc(c"u_rimcol"),
+                    shinv: loc(c"u_shinv"), shcol: loc(c"u_shcol"), focus: loc(c"u_focus"),
+                };
+                use_prog(program);
+                glUniform2f(loc(c"u_tscreen"), SCR_W, SCR_H);
+                glUniform1i(loc(c"u_tex"), 0);
+                glUniform1i(loc(c"u_fore_tex"), 1);
+                (program, uniforms, loc(c"u_fore_halfsize"))
+            });
+            if SCENE_IMAGES[index].is_none() { log("scene card program unavailable — using contained foreground"); }
+        }
+
         ART_WASH = link_optional_program(VS_ART_WASH.as_ptr(), FS_ART_WASH.as_ptr()).map(|prog| {
             let loc = |name: &CStr| glGetUniformLocation(prog, name.as_ptr());
             // Binds `prog`, which the two constant uniforms below are then written to.
@@ -2797,6 +2818,33 @@ pub(crate) fn draw_tex_carded(
 ) {
     note_card(x, y, w, h, pad, dy);
     draw_tex_impl(tex, crop, x, y, w, h, radius, tint, rimw, rimcol, pad, shblur, shcol, f, dy, None);
+}
+
+/// Composite a contained foreground over a cover-cropped blurred still, once through
+/// the ordinary card SDF/shadow/gloss. The inset foreground never gets its own outline.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_scene_card(foreground: c_uint, background: c_uint, crop: [f32; 4],
+    x: f32, y: f32, w: f32, h: f32, halfsize: (f32, f32), radius: f32,
+    tint: *const f32, rimw: f32, rimcol: *const f32, pad: f32, shblur: f32,
+    shcol: *const f32, focus: f32, dy: f32) -> bool {
+    let Some((program, uniforms, loc_fore)) = (unsafe { SCENE_IMAGES[usize::from(wants_focus_program(focus, dy))] }) else { return false };
+    if foreground == 0 || background == 0 || halfsize.0 <= 0. || halfsize.1 <= 0. { return false; }
+    unsafe {
+        use_prog(program);
+        glUniform2f(loc_fore, halfsize.0, halfsize.1);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, foreground);
+        glActiveTexture(GL_TEXTURE0);
+    }
+    note_card(x, y, w, h, pad, dy);
+    draw_tex_impl(background, crop, x, y, w, h, radius, tint, rimw, rimcol, pad, shblur,
+        shcol, focus, dy, Some((program, uniforms)));
+    unsafe {
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glActiveTexture(GL_TEXTURE0);
+    }
+    true
 }
 
 /// `pad`/`dy` mirror [`draw_tex_impl`]'s own asymmetric-inflation formula so this diagnostic checks
@@ -6955,6 +7003,18 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn scene_card_shader_layers_before_the_one_outer_focus_material() {
+        let plain = preprocess(FS_IMG.to_str().unwrap(), &[]);
+        assert!(!plain.contains("u_fore_tex"));
+        let scene = preprocess(FS_SCENE_FOCUS.to_str().unwrap(), &["PLX_SCENE_CARD", "PLX_FOCUS"]);
+        assert!(scene.contains("texture2D(u_fore_tex, fore_uv)"));
+        assert!(scene.contains("fore_p.y += u_focus.z"));
+        assert!(scene.contains("greaterThanEqual(fore_uv"));
+        assert!(scene.contains("u_card"));
+        assert!(!scene.contains("fore_radius"));
     }
 
     /// The whole reason [`FOCUS_IMAGE`] exists: a resting card, a glyph, a blur reduction, a

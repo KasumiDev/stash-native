@@ -4,7 +4,7 @@ A native Stash client for rooted LG webOS televisions, adapted from [PlxNative](
 
 Source: [KasumiDev/stash-native](https://github.com/KasumiDev/stash-native).
 
-The interface includes Home, Performers, Scenes, Galleries, Tags, Search, and Settings. Home shows newest scenes, favorite performers before other performers ordered by o-count, and favorite tag shelves. Scene cards have delayed focus previews; performer portraits support animated WebP. Galleries support a full-screen viewer and timed slideshows.
+The interface includes Home, Performers, Scenes, Galleries, Tags, Search, and Settings. Home shows newest scenes, favorite performers before other performers ordered by o-count, and favorite tag shelves. Scene cards have delayed focus previews; performer portraits support animated WebP. Galleries support a full-screen viewer and timed slideshows. Performer and tag details include paginated Favorites shelves (scenes rated 100/100) and favorite-tag intersections. Focused scene cards show duration and a five-star rating when available.
 
 See [Windows setup and installation](docs/stashnative-setup.md) for beginner instructions and [verification evidence](docs/stashnative-verification.md) for what has actually been tested. Simulator results do not establish TV playback or performance.
 

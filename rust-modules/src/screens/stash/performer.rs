@@ -3,15 +3,15 @@ use super::catalog::StashScreen;
 use crate::screens::stash_registry::*;
 use crate::stash::{SceneTagSummary, Tag};
 use crate::stores::stash::Work;
-use crate::ui::consts::{MARGIN_X, MARGIN_Y, SCR_W};
+use crate::ui::consts::{MARGIN_X, SCR_W};
+use crate::ui::hero_content;
 use crate::ui::machine::*;
 use crate::ui::screen::*;
 use crate::ui::text_view::TextView;
-use crate::ui::widgets::{Button, TabPill};
+use crate::ui::widgets::Button;
 use crate::ui::{theme, Env, Rect, View};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::ffi::CString;
 
 const HERO: GroupId = GroupId(0);
 const SCENES: u32 = 0x1000_0010;
@@ -145,40 +145,19 @@ impl PerformerScreen {
         }
         facts.join(" · ")
     }
-    fn badges(&self, cx: &Cx<'_, StashHost>, tags: &[Tag], top: f32) -> Vec<(Rect, CString)> {
-        let mut x = TEXT_X;
-        let mut y = top;
-        tags.iter()
-            .map(|tag| {
-                let badge_width = (TEXT_W - theme::space::SM * 2.) / 3.;
-                let label = crate::text::elide_by(&tag.name, badge_width - 44., false, |s| {
-                    cx.measure.width_str(s, theme::size::CAPTION, true)
-                });
-                let width =
-                    TabPill::width_measured(&label, theme::size::CAPTION, cx.measure).min(TEXT_W);
-                if x + width > TEXT_X + TEXT_W {
-                    x = TEXT_X;
-                    y += crate::ui::widgets::BADGE_H + theme::space::SM;
-                }
-                let rect = Rect::new(x, y, width, crate::ui::widgets::BADGE_H);
-                x += width + theme::space::SM;
-                (rect, CString::new(label.replace('\0', "")).unwrap())
-            })
-            .collect()
+    fn badges(&self, cx: &Cx<'_, StashHost>, tags: &[Tag]) -> hero_content::PassiveBadges {
+        let labels = tags.iter().map(|tag| tag.name.as_str()).collect::<Vec<_>>();
+        hero_content::PassiveBadges::new(&labels, TEXT_W, cx.measure)
     }
     fn layout(&self, cx: &Cx<'_, StashHost>) -> (f32, f32, f32, f32, f32) {
-        let top = MARGIN_Y + theme::space::XL;
+        let top = crate::ui::widgets::TOP_BAR_BOTTOM + theme::space::XL;
         let description = top + self.title(cx).measure_h(TEXT_W) + theme::space::MD;
         let facts = description + self.description(cx).measure_h(TEXT_W) + theme::space::MD;
         let models = facts + cx.measure.cap_h(theme::size::CAPTION) + theme::space::MD;
         let model_end = self
             .content
             .performer()
-            .map(|p| {
-                self.badges(cx, &p.tags, models)
-                    .last()
-                    .map_or(models, |b| b.0.y + b.0.h)
-            })
+            .map(|p| models + self.badges(cx, &p.tags).height())
             .unwrap_or(models);
         let popular = model_end + theme::space::MD;
         // Reserve the final two tag rows before aggregation lands, keeping the focused grid still.
@@ -352,9 +331,17 @@ impl Machine<StashHost> for PerformerScreen {
         self.content.detail_inset(
             self.layout(cx).4 + crate::ui::widgets::StatusOverlay::CTRL_H + theme::space::XL,
         );
+        let collapsed =
+            hero_content::collapse_fraction(self.content.scroll(), self.layout(cx).4) > 0.;
+        self.content.hit_clearance(if collapsed {
+            hero_content::pinned_name_bottom(cx.measure)
+        } else {
+            0.
+        });
         let images = self
             .content
             .performer()
+            .filter(|_| self.content.scroll() < self.layout(cx).4)
             .and_then(|p| {
                 p.image_path.as_ref().map(|url| {
                     vec![
@@ -471,6 +458,7 @@ impl Screen<StashHost> for PerformerScreen {
         }
     }
     fn draw(&mut self, f: &mut DrawFrame<'_, '_, StashHost>) {
+        let collapse = hero_content::collapse_fraction(self.content.scroll(), self.layout(f.cx).4);
         if let Some(performer) = self.content.performer() {
             let scroll = self.content.scroll();
             let a = (1. - scroll / self.layout(f.cx).4).clamp(0., 1.);
@@ -503,7 +491,7 @@ impl Screen<StashHost> for PerformerScreen {
             {
                 let box_rect = Rect::new(
                     MARGIN_X,
-                    MARGIN_Y + theme::space::XL - scroll,
+                    crate::ui::widgets::TOP_BAR_BOTTOM + theme::space::XL - scroll,
                     PORTRAIT_W,
                     PORTRAIT_H,
                 );
@@ -518,7 +506,16 @@ impl Screen<StashHost> for PerformerScreen {
             }
             self.title(f.cx).draw(
                 p,
-                Rect::new(TEXT_X, MARGIN_Y + theme::space::XL - scroll, TEXT_W, 0.),
+                Rect::new(
+                    TEXT_X + (MARGIN_X - TEXT_X) * collapse,
+                    hero_content::pinned_title_y(
+                        crate::ui::widgets::TOP_BAR_BOTTOM + theme::space::XL,
+                        scroll,
+                        crate::ui::widgets::TOP_BAR_BOTTOM + theme::space::MD,
+                    ),
+                    TEXT_W,
+                    0.,
+                ),
             );
             let (description, facts, models, popular, _) = self.layout(f.cx);
             self.description(f.cx)
@@ -528,14 +525,8 @@ impl Screen<StashHost> for PerformerScreen {
                 .with_measure(f.cx.measure)
                 .max_lines(1)
                 .draw(p, Rect::new(TEXT_X, facts - scroll, TEXT_W, 0.));
-            for (rect, label) in self.badges(f.cx, &performer.tags, models) {
-                TabPill::new(
-                    label.as_ptr(),
-                    theme::size::CAPTION,
-                    Rect::new(rect.x, rect.y - scroll, rect.w, rect.h),
-                )
-                .draw(&Env::inert(), p);
-            }
+            self.badges(f.cx, &performer.tags)
+                .draw(p, TEXT_X, models - scroll, f.cx.measure);
             if !self.top.is_empty() {
                 TextView::new(
                     crate::i18n::msg::stash_performer_popular_tags(),
@@ -545,18 +536,12 @@ impl Screen<StashHost> for PerformerScreen {
                 .with_measure(f.cx.measure)
                 .max_lines(1)
                 .draw(p, Rect::new(TEXT_X, popular - scroll, TEXT_W, 0.));
-                for (rect, label) in self.badges(
-                    f.cx,
-                    &self.top,
-                    popular + f.cx.measure.cap_h(theme::size::CAPTION) + theme::space::SM,
-                ) {
-                    TabPill::new(
-                        label.as_ptr(),
-                        theme::size::CAPTION,
-                        Rect::new(rect.x, rect.y - scroll, rect.w, rect.h),
-                    )
-                    .draw(&Env::inert(), p);
-                }
+                self.badges(f.cx, &self.top).draw(
+                    p,
+                    TEXT_X,
+                    popular + f.cx.measure.cap_h(theme::size::CAPTION) + theme::space::SM - scroll,
+                    f.cx.measure,
+                );
             }
             if self.tags_error {
                 TextView::new(
@@ -578,7 +563,17 @@ impl Screen<StashHost> for PerformerScreen {
                         key,
                         rect,
                         rest_rect: rect,
-                        clip: Rect::FULL,
+                        clip: if collapse > 0. {
+                            Rect::new(
+                                0.,
+                                hero_content::pinned_name_bottom(f.cx.measure),
+                                SCR_W,
+                                crate::ui::consts::SCR_H
+                                    - hero_content::pinned_name_bottom(f.cx.measure),
+                            )
+                        } else {
+                            Rect::FULL
+                        },
                         hover: Hover::Focus,
                         activate: Activate::Press,
                     },
@@ -603,7 +598,17 @@ impl Screen<StashHost> for PerformerScreen {
                         key,
                         rect,
                         rest_rect: rect,
-                        clip: Rect::FULL,
+                        clip: if collapse > 0. {
+                            Rect::new(
+                                0.,
+                                hero_content::pinned_name_bottom(f.cx.measure),
+                                SCR_W,
+                                crate::ui::consts::SCR_H
+                                    - hero_content::pinned_name_bottom(f.cx.measure),
+                            )
+                        } else {
+                            Rect::FULL
+                        },
                         hover: Hover::Focus,
                         activate: Activate::Press,
                     },
@@ -618,6 +623,9 @@ impl Screen<StashHost> for PerformerScreen {
             }
         }
         self.content.draw(f);
+        if let Some(performer) = self.content.performer() {
+            hero_content::draw_pinned_name(f.painter, &performer.name, collapse, f.cx.measure);
+        }
     }
 }
 

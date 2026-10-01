@@ -102,8 +102,27 @@ vec4 stillOver(vec3 rgb, float alpha, float coverage, float ramp){
   return vec4(rgb * keep + u_still_col.rgb * s, s + keep);
 }
 #endif
+#ifdef PLX_SCENE_CARD
+// The background is a cached blurred STILL; the foreground can be a transient preview.
+// Both layers share the existing outer SDF and focus material, never an inset rounded box.
+uniform sampler2D u_fore_tex;
+uniform highp vec2 u_fore_halfsize;
+#endif
 void main(){
   vec4 c = texture2D(u_tex, v_cuv);
+#ifdef PLX_SCENE_CARD
+  highp vec2 fore_p = v_p;
+#ifdef PLX_FOCUS
+  fore_p.y += u_focus.z;
+#endif
+  highp vec2 fore_uv = fore_p / (2.0 * u_fore_halfsize) + 0.5;
+  if (all(greaterThanEqual(fore_uv, vec2(0.0))) && all(lessThanEqual(fore_uv, vec2(1.0)))) {
+    vec4 fore = texture2D(u_fore_tex, fore_uv);
+    float alpha = fore.a + c.a * (1.0 - fore.a);
+    c.rgb = (fore.rgb * fore.a + c.rgb * c.a * (1.0 - fore.a)) / max(alpha, 0.00001);
+    c.a = alpha;
+  }
+#endif
 #ifdef PLX_STILL_GROUND
   // The CPU admits only an exactly-white tint to this specialization.
   vec3 tex = c.rgb;
