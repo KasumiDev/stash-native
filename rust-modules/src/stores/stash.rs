@@ -345,7 +345,7 @@ fn fixture(route: &StashArg, query: &Query) -> PageData {
             date: Some("2026-09-01".into()),
             details: Some("A synthetic scene for checking the shared movie detail layout, navigation, and playback controls.".into()),
             studio: Some(crate::stash::Studio { id: "fixture".into(), name: "Fixture Studio".into() }),
-            files: vec![crate::stash::SceneFile { duration: 1560., width: if id % 7 == 0 { 3840 } else if id % 5 == 0 || id % 3 == 0 { 1080 } else { 1920 }, height: if id % 3 == 0 && id % 5 != 0 && id % 7 != 0 { 1920 } else { 1080 }, video_codec: "h264".into(), audio_codec: "aac".into(), format: "mp4".into() }],
+            files: vec![crate::stash::SceneFile { duration: 1560., frame_rate: 30., width: if id % 7 == 0 { 3840 } else if id % 5 == 0 || id % 3 == 0 { 1080 } else { 1920 }, height: if id % 3 == 0 && id % 5 != 0 && id % 7 != 0 { 1920 } else { 1080 }, video_codec: "h264".into(), audio_codec: "aac".into(), format: "mp4".into() }],
             resume_time: if id == 1 { 120. } else { 0. },
             o_counter: id,
             rating100: if id % 4 == 0 { Some(100) } else if id % 7 == 0 { None } else { Some(90) },

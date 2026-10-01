@@ -618,10 +618,10 @@ pub(crate) fn clear_url(ps: &mut PlaybackSession) {
 
 /// URL-fed Stash playback owns no Plex identity or server resources. The native route reducer
 /// still owns the Load transaction, and history is supplied by stash_media::Playback.
-pub(crate) fn prepare_stash_stream(ps: &mut PlaybackSession, scene_id:&str, url: &str, vc: &str, ac: &str, width:u16,height:u16) -> bool {
+pub(crate) fn prepare_stash_stream(ps: &mut PlaybackSession, scene_id:&str, url: &str, vc: &str, ac: &str, width:u16,height:u16,fps:f64) -> bool {
     *ps = PlaybackSession::default();
     ps.stash_scene_id=Some(scene_id.to_owned());
-    if !set_stream_declaration(ps,vc,ac,0.0,crate::metadata::Dovi::NONE,false) { return false; }
+    if !set_stream_declaration(ps,vc,ac,fps,crate::metadata::Dovi::NONE,false) { return false; }
     set_stream_source_raster(ps,width,height);
     set_url(ps,url);
     install_active_encoder("");

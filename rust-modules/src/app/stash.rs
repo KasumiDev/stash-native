@@ -672,7 +672,9 @@ unsafe fn run_inner() -> c_int {
             }
         }
         if report.presented {
-            crate::surface::probe(platform.win);
+            // Platform boot probes the drawable once after creating the GL context.
+            // Re-probing here repeats panel queries and logging on every video frame,
+            // and recreates the simulator's supersampling framebuffer.
             if matches!(dispatcher.top_arg(), Some(StashArg::Player(_))) {
                 crate::gfx::frame_clear_through();
             } else {

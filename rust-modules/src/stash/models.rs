@@ -44,7 +44,7 @@ pub struct SceneMarker {
     pub seconds: f64,
     pub end_seconds: Option<f64>,
     pub screenshot: Option<String>,
-    /// Resolved by the client, not a requested GraphQL field.
+    /// GraphQL aliases the server's marker `stream` field to this preview URL.
     pub preview: Option<String>,
 }
 
@@ -76,6 +76,8 @@ pub struct ScenePaths {
 #[serde(default)]
 pub struct SceneFile {
     pub duration: f64,
+    #[serde(deserialize_with = "null_default")]
+    pub frame_rate: f64,
     pub width: u32,
     pub height: u32,
     pub video_codec: String,

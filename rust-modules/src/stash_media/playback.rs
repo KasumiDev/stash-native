@@ -164,6 +164,7 @@ impl Playback {
             &stream.audio,
             stream.width,
             stream.height,
+            stream.fps,
         ) {
             return Err("The scene cannot be played by this TV".into());
         }
@@ -328,6 +329,7 @@ impl Playback {
                     &stream.audio,
                     stream.width,
                     stream.height,
+                    stream.fps,
                 ) && player::engine::start_bufferfeed(&mut self.session, &mut self.adapter)
                 {
                     player::engine::stash_stream_offset((seconds * 1e9) as i64);
@@ -514,6 +516,7 @@ struct Selected {
     audio: String,
     width: u16,
     height: u16,
+    fps: f64,
     transcoded: bool,
     duration: f64,
 }
@@ -551,6 +554,7 @@ fn select_stream(scene: &Scene) -> Option<Selected> {
                 audio,
                 width: file.unwrap().width.min(u16::MAX as u32) as u16,
                 height: file.unwrap().height.min(u16::MAX as u32) as u16,
+                fps: source_fps(file.unwrap().frame_rate),
                 transcoded: false,
                 duration: file.unwrap().duration,
             });
@@ -586,13 +590,44 @@ fn select_stream(scene: &Scene) -> Option<Selected> {
             },
             width: 1280,
             height: 720,
+            // Stash does not declare the encoded stream's rate; never claim that
+            // its source metadata necessarily describes the server output.
+            fps: 0.0,
             transcoded: true,
             duration: file.map(|f| f.duration).unwrap_or_default(),
         })
 }
+fn source_fps(fps: f64) -> f64 {
+    if fps.is_finite() && fps > 0.0 { fps } else { 0.0 }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stash_direct_load_preserves_source_frame_rate() {
+        let _guard = crate::testlock::serial();
+        for fps in [23.976, 29.97, 60.0] {
+            let scene: Scene = serde_json::from_value(serde_json::json!({
+                "id": "synthetic",
+                "paths": { "stream": "http://example.test/scene/synthetic/stream" },
+                "files": [{ "width": 3840, "height": 2160,
+                    "video_codec": "h264", "audio_codec": "aac", "frame_rate": fps }]
+            })).unwrap();
+            let stream = select_stream(&scene).unwrap();
+            let mut session = route::PlaybackSession::default();
+            assert!(route::prepare_stash_stream(&mut session, &scene.id, &stream.url,
+                &stream.video, &stream.audio, stream.width, stream.height, stream.fps));
+            assert_eq!(route::stream_fps(&session), fps);
+        }
+    }
+    #[test]
+    fn unknown_and_invalid_frame_rates_stay_unknown() {
+        for fps in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(source_fps(fps), 0.0);
+        }
+        let file: crate::stash::SceneFile = serde_json::from_str(r#"{"frame_rate":null}"#).unwrap();
+        assert_eq!(file.frame_rate, 0.0);
+    }
     #[test]
     #[cfg(feature = "hostsim")]
     fn playback_adapter_respects_native_refusal_and_rejects_unstarted_seeks() {

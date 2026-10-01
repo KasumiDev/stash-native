@@ -112,7 +112,7 @@ pub struct Client {
 const PERFORMER: &str = "id name image_path favorite o_counter";
 const TAG: &str = "id name image_path favorite";
 const IMAGE: &str = "id title paths { image thumbnail }";
-const SCENE: &str = "id title date rating100 details studio { id name } o_counter resume_time play_duration play_count paths { screenshot preview stream webp } files { duration width height video_codec audio_codec format } sceneStreams { url mime_type label } performers { id name image_path favorite o_counter } tags { id name image_path favorite }";
+const SCENE: &str = "id title date rating100 details studio { id name } o_counter resume_time play_duration play_count paths { screenshot preview stream webp } files { duration frame_rate width height video_codec audio_codec format } sceneStreams { url mime_type label } performers { id name image_path favorite o_counter } tags { id name image_path favorite }";
 const GALLERY: &str = "id title image_count cover { id title paths { image thumbnail } } performers { id name image_path favorite o_counter } tags { id name image_path favorite }";
 
 impl Client {
@@ -328,7 +328,7 @@ impl Client {
     pub fn scene(&self, id: &str) -> Result<Scene, Error> {
         let mut scene: Scene = self.detail(
             "findScene",
-            &format!("{SCENE} scene_markers {{ id title seconds end_seconds screenshot }}"),
+            &format!("{SCENE} scene_markers {{ id title seconds end_seconds screenshot preview: stream }}"),
             id,
         )?;
         self.marker_media(&mut scene)?;
@@ -341,18 +341,12 @@ impl Client {
                 marker.preview = None;
                 continue;
             }
-            let mut segment = String::new();
-            for byte in marker.id.bytes() {
-                if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
-                    segment.push(byte as char);
-                } else {
-                    use std::fmt::Write;
-                    let _ = write!(segment, "%{byte:02X}");
-                }
-            }
-            marker.screenshot =
-                Some(self.media_url(&format!("/scene_marker/{segment}/screenshot"))?);
-            marker.preview = Some(self.media_url(&format!("/scene_marker/{segment}/stream"))?);
+            marker.screenshot = marker.screenshot.as_deref()
+                .filter(|url| !url.trim().is_empty())
+                .map(|url| self.media_url(url)).transpose()?;
+            marker.preview = marker.preview.as_deref()
+                .filter(|url| !url.trim().is_empty())
+                .map(|url| self.media_url(url)).transpose()?;
         }
         Ok(())
     }
@@ -696,7 +690,7 @@ mod tests {
         }
     }
     #[test]
-    fn marker_media_uses_canonical_endpoints_and_same_origin_auth() {
+    fn marker_media_preserves_server_scene_path_and_same_origin_auth() {
         let client = Client::new(Config {
             server_url: "https://example.test/graphql".into(),
             api_key: "a& b".into(),
@@ -706,7 +700,8 @@ mod tests {
             scene_markers: vec![
                 super::super::SceneMarker {
                     id: "19/unsafe".into(),
-                    screenshot: Some("https://other.test/old".into()),
+                    screenshot: Some("https://example.test/scene/synthetic/scene_marker/19/screenshot".into()),
+                    preview: Some("https://example.test/scene/synthetic/scene_marker/19/stream".into()),
                     ..Default::default()
                 },
                 super::super::SceneMarker::default(),
@@ -716,11 +711,11 @@ mod tests {
         client.marker_media(&mut scene).unwrap();
         assert_eq!(
             scene.scene_markers[0].screenshot.as_deref(),
-            Some("https://example.test/scene_marker/19%2Funsafe/screenshot?apikey=a%26%20b")
+            Some("https://example.test/scene/synthetic/scene_marker/19/screenshot?apikey=a%26%20b")
         );
         assert_eq!(
             scene.scene_markers[0].preview.as_deref(),
-            Some("https://example.test/scene_marker/19%2Funsafe/stream?apikey=a%26%20b")
+            Some("https://example.test/scene/synthetic/scene_marker/19/stream?apikey=a%26%20b")
         );
         assert!(scene.scene_markers[1].preview.is_none());
     }

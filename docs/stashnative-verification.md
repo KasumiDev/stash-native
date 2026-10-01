@@ -26,3 +26,11 @@ Firmware source review confirmed the preview wrapper uses matching bundled FFmpe
 Use dedicated test content for history and counter writes. Do not automatically retry a timed-out additive mutation: the server may already have applied it.
 
 See [setup and installation](stashnative-setup.md). Stable release publication is not part of this debug handover.
+
+## Playback regression investigation after 2e328acd
+
+The installed debug executable was matched by hash to the published package before collecting native playback logs. The sink reported dropped frames. A source with 60 fps was loaded with an unknown frame rate, and native sourceInfo reported 30 fps. The Stash client now queries `frame_rate` and carries valid direct-stream rates through the existing native Load declaration; server-transcoded rates remain unknown unless declared by the server. Host regressions cover fractional and integer rates, missing/null rates, and invalid values. These checks establish metadata propagation, not a TV performance improvement.
+
+Marker media now uses Stash's GraphQL `screenshot` and `stream` URLs. The previous constructed root-level marker route returned HTML on the tested server; the server-provided scene-qualified route returned an H.264 preview. The existing still cache and muted software decoder consume those URLs with the same authentication handling. Repeated surface probing was also removed from the draw loop; platform boot already performs it once.
+
+Hardware playback smoothness and simultaneous marker-preview performance still require owner-controlled installation and TV retesting. The diagnostic session did not deploy a package or activate O +1.
