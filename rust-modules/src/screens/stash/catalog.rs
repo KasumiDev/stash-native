@@ -112,7 +112,26 @@ impl StashScreen {
         if Self::pinned(row) {
             row.y
         } else {
-            row.y + crate::ui::poster_grid::growth_before(row.ordinal, &self.bands.geometry())
+            let shelf_growth = if matches!(self.route, StashArg::Performer(_)) {
+                // strip's label reveal and document displacement read the SAME CardRow spring.
+                self.rows
+                    .iter()
+                    .take(row.ordinal)
+                    .filter(|prior| {
+                        !prior.collection
+                            && prior
+                                .tiles
+                                .first()
+                                .is_some_and(|tile| !tile.identity.starts_with("control:"))
+                    })
+                    .map(|prior| prior.motion.under_band() - card_row::LABEL_BAND_COLLAPSED)
+                    .sum()
+            } else {
+                0.
+            };
+            row.y
+                + crate::ui::poster_grid::growth_before(row.ordinal, &self.bands.geometry())
+                + shelf_growth
                 - self.state.scroll
         }
     }
@@ -786,7 +805,8 @@ impl StashScreen {
                 y += style.h
                     + if control {
                         theme::space::MD
-                    } else if collection {
+                    } else if collection || matches!(self.route, StashArg::Performer(_)) {
+                        // The shared animated band adds expansion separately in row_y.
                         card_row::LABEL_BAND_COLLAPSED + crate::ui::consts::UNDER_LABEL_AIR
                     } else {
                         TileLabel::height(true) + theme::space::XL
@@ -794,6 +814,22 @@ impl StashScreen {
             }
             if control && self.detail_inset.is_none() {
                 y = self.reveal_top() - CARD_DY;
+            }
+        }
+        if matches!(self.route, StashArg::Performer(_)) {
+            let mut lift_clearance = 0.;
+            for index in 0..self.rows.len() {
+                self.rows[index].y += lift_clearance;
+                if !self.rows[index].collection
+                    && self.rows[index]
+                        .tiles
+                        .first()
+                        .is_some_and(|tile| !tile.identity.starts_with("control:"))
+                {
+                    if let Some(next) = self.rows.get(index + 1) {
+                        lift_clearance += card_row::heading_lift_max(&next.style);
+                    }
+                }
             }
         }
     }
@@ -1263,7 +1299,18 @@ impl Machine<StashHost> for StashScreen {
                                 - (SCR_H - crate::ui::consts::MARGIN_Y),
                             row.y
                                 - if matches!(self.route, StashArg::Performer(_)) {
-                                    crate::ui::hero_content::pinned_name_bottom(cx.measure)
+                                    // Reserve the name before a focus reveal crosses its threshold;
+                                    // pointer clipping still follows the actually visible fade.
+                                    let nav = crate::ui::widgets::TOP_BAR_BOTTOM;
+                                    let unpinned_scroll =
+                                        row.y - nav - card_row::heading_lift_max(&row.style);
+                                    let hero_bottom =
+                                        self.detail_inset.unwrap_or(0.) - theme::space::XL;
+                                    if self.hit_top > 0. || hero_bottom - unpinned_scroll <= nav {
+                                        crate::ui::hero_content::pinned_name_bottom(cx.measure)
+                                    } else {
+                                        nav
+                                    }
                                 } else {
                                     self.reveal_top()
                                 }
@@ -1847,6 +1894,106 @@ mod tests {
         }
     }
     #[test]
+    fn performer_focused_caption_clears_the_actual_next_heading() {
+        let config = Config::default();
+        let textures = HashMap::new();
+        let playback = PlaybackView::default();
+        let mut screen = StashScreen::new(StashArg::Performer("1".into()), EntryId(1));
+        screen.data = data(&["1"]);
+        screen.data.title = "Performer".into();
+        screen.data.performer = Some(crate::stash::Performer {
+            id: "1".into(),
+            ..Default::default()
+        });
+        screen.data.sections[0].title = "Favorites".into();
+        screen.data.sections[0].shelf = true;
+        screen.data.sections[0].tiles[0].caption = "1:30 · ★ 4.5".into();
+        let mut second = screen.data.sections[0].clone();
+        second.title = "Tag 1".into();
+        screen.data.sections.push(second);
+        screen.detail_inset(900.);
+        screen.rebuild();
+        let focus = FocusKey {
+            entry: screen.entry,
+            elem: screen.rows[0].keys[0],
+        };
+        let cx = Cx {
+            views: Views {
+                textures: &textures,
+                config: &config,
+                playback: &playback,
+            },
+            tick: Tick::default(),
+            measure: &Measure,
+            press: PressRead::default(),
+            focus: FocusRead {
+                current: Some(focus),
+                ..Default::default()
+            },
+            owner: InputOwner::Entry(screen.entry),
+        };
+        let mut out = Vec::new();
+        let mut present = crate::ui::present::Present::new();
+        for frame in 0..120 {
+            out.clear();
+            let mut fx = Effects::new(&mut out, MachineId::Instance(InstanceId(1)), &mut present);
+            screen.step(
+                &ScreenEvent::Tick(Tick {
+                    ms: frame * 16,
+                    dt_us: 16_667,
+                }),
+                &cx,
+                &mut fx,
+            );
+            let first = &screen.rows[0];
+            let next = &screen.rows[1];
+            let next_heading = screen.row_y(next) - CARD_DY - TITLE_DY - next.motion.lift();
+            let caption_bottom = screen.row_y(first) + first.style.h + TileLabel::height(true);
+            if first.motion.band_reveal() > 0. {
+                assert!(next_heading>=caption_bottom,
+                    "frame {frame}: next heading {next_heading} overlaps visible caption ending {caption_bottom}");
+            }
+            if frame == 119 {
+                assert!(
+                    next_heading >= caption_bottom + crate::ui::consts::UNDER_LABEL_AIR,
+                    "next heading {next_heading} overlaps focused caption ending {caption_bottom}"
+                );
+            }
+        }
+        let cx = Cx {
+            focus: FocusRead {
+                current: Some(FocusKey {
+                    entry: screen.entry,
+                    elem: screen.rows[1].keys[0],
+                }),
+                ..Default::default()
+            },
+            ..cx
+        };
+        for frame in 0..120 {
+            out.clear();
+            let mut fx = Effects::new(&mut out, MachineId::Instance(InstanceId(1)), &mut present);
+            screen.step(
+                &ScreenEvent::Tick(Tick {
+                    ms: 2000 + frame * 16,
+                    dt_us: 16_667,
+                }),
+                &cx,
+                &mut fx,
+            );
+            let first = &screen.rows[0];
+            let next = &screen.rows[1];
+            if first.motion.band_reveal() > 0. {
+                let next_heading = screen.row_y(next) - CARD_DY - TITLE_DY - next.motion.lift();
+                let caption_bottom = screen.row_y(first) + first.style.h + TileLabel::height(true);
+                assert!(
+                    next_heading >= caption_bottom,
+                    "closing caption overlaps incoming heading"
+                );
+            }
+        }
+    }
+    #[test]
     fn collection_viewport_includes_pixels_above_controls() {
         let screen = StashScreen::new(StashArg::Scenes, EntryId(1));
         assert_eq!(screen.content_view().y, 0.);
@@ -2163,7 +2310,10 @@ mod tests {
             entry: screen.entry,
             elem: screen.rows[1].keys[1],
         };
-        let source = screen.place(&from.elem, &cx, At::SpringTarget).unwrap().rect;
+        let source = screen
+            .place(&from.elem, &cx, At::SpringTarget)
+            .unwrap()
+            .rect;
         let Step::Move(to) = screen.neighbour(from, Dir::Up, &cx) else {
             panic!("adjacent shelf missing")
         };

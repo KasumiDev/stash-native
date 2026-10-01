@@ -9,6 +9,8 @@
 #include <libavcodec/avcodec.h>
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
+/* Presentation ceiling; decode the original stream without encoding a substitute. */
+enum { PREVIEW_FPS = 30 };
 #define API_LIST(X) \
  X(avformat_alloc_context) X(avio_alloc_context) X(av_malloc) X(av_free) \
  X(avformat_open_input) X(avformat_find_stream_info) X(av_find_best_stream) \
@@ -124,11 +126,11 @@ int stash_preview_next(void *decoder,uint8_t *rgba,int *width,int *height,int64_
   p->av_packet_unref(p->packet); if(send<0&&send!=AVERROR(EAGAIN)) return -1;
  }
  AVFrame *f=p->frame; if(!preview_raster(f->width,f->height)||!preview_format(p,f->format)) return -1;
- *pts_ms=f->best_effort_timestamp==AV_NOPTS_VALUE?p->output_frames*1000/15:(int64_t)(f->best_effort_timestamp*av_q2d(p->fmt->streams[p->stream]->time_base)*1000);
+ *pts_ms=f->best_effort_timestamp==AV_NOPTS_VALUE?p->output_frames*1000/PREVIEW_FPS:(int64_t)(f->best_effort_timestamp*av_q2d(p->fmt->streams[p->stream]->time_base)*1000);
  if(!p->have_origin){p->origin_ms=*pts_ms;p->have_origin=1;}
- /* Fixed rational deadlines avoid a rounded 67 ms interval rejecting the next
-  * 30 fps frame at 133 ms. Skip conversion, not reference-frame decoding. */
- if(*pts_ms-p->origin_ms<p->output_frames*1000/15) return 2;
+ /* Fixed rational deadlines retain the cadence of <=30 fps input.
+  * Skip conversion above the ceiling, not reference-frame decoding. */
+ if(*pts_ms-p->origin_ms<p->output_frames*1000/PREVIEW_FPS) return 2;
  p->output_frames++;
  double ratio=640.0/f->width; if(360.0/f->height<ratio) ratio=360.0/f->height; if(ratio>1) ratio=1;
  *width=(int)(f->width*ratio); *height=(int)(f->height*ratio);

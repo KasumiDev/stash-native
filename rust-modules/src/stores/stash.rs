@@ -42,10 +42,13 @@ pub enum Action {
     Sort,
     EditSearch,
     Pause,
+    SetPaused(bool),
     AddO,
     Replay,
     SeekTo(f64),
+    #[expect(dead_code, reason = "Native track selection remains available without overlay buttons")]
     AudioTrack(i32),
+    #[expect(dead_code, reason = "Native track selection remains available without overlay buttons")]
     SubtitleTrack(i32),
 }
 pub enum StashMsg {
@@ -350,7 +353,7 @@ fn fixture(route: &StashArg, query: &Query) -> PageData {
                 screenshot: Some(format!("fixture://scene/{id}")),
                 ..Default::default()
             },
-            scene_markers: vec![crate::stash::SceneMarker { id:format!("{id}-1"),title:"Opening".into(),seconds:30.,end_seconds:Some(60.),screenshot:Some(format!("fixture://scene/{id}")) }, crate::stash::SceneMarker { id:format!("{id}-2"), title:"Later scene".into(),seconds:180.,..Default::default() }],
+            scene_markers: vec![crate::stash::SceneMarker { id:format!("{id}-1"),title:"Opening".into(),seconds:30.,end_seconds:Some(60.),screenshot:Some(format!("fixture://scene/{id}")), ..Default::default() }, crate::stash::SceneMarker { id:format!("{id}-2"), title:"Later scene".into(),seconds:180.,..Default::default() }],
             performers: performers[..2].to_vec(),
             tags: tags.clone(),
             ..Default::default()

@@ -18,6 +18,7 @@ pub(crate) struct Playback {
     completed: bool,
     repause_at: Option<i64>,
     o_pending: bool,
+    o_last: Option<u64>,
     pub sync_error: Option<String>,
     pub o_count: Option<i64>,
     pub scene_id: Option<String>,
@@ -37,6 +38,19 @@ struct ActivityClock {
 }
 fn paused_seek_landed(target: i64, pending: i64, frames: i32, position: i64) -> bool {
     pending < 0 && frames >= 1 && position.saturating_add(15_000_000_000) >= target
+}
+fn toggle_transport(
+    paused: bool,
+    mut actuator: impl FnMut(bool) -> bool,
+) -> Result<bool, &'static str> {
+    let pause = !paused;
+    if actuator(pause) {
+        Ok(pause)
+    } else if pause {
+        Err("The player could not pause playback")
+    } else {
+        Err("The player could not resume playback")
+    }
 }
 impl ActivityClock {
     fn sample(&mut self, elapsed: Duration, position: f64, moving: bool) -> Duration {
@@ -114,6 +128,7 @@ impl Playback {
             completed: false,
             repause_at: None,
             o_pending: false,
+            o_last: None,
             sync_error: None,
             o_count: None,
             scene_id: None,
@@ -176,6 +191,7 @@ impl Playback {
         self.sync_error = None;
         self.completed = false;
         self.o_pending = false;
+        self.o_last = None;
         Ok(())
     }
     pub fn tick(&mut self, now_ms: u64) {
@@ -203,9 +219,16 @@ impl Playback {
         }
         player::pump(&mut self.session, &mut self.adapter, now_ms as u32);
         route::drain_route_start_results(&mut self.session);
-        if self.repause_at.is_some_and(|target| paused_seek_landed(target, player::seek_pending(), player::frames(), player::playpos_ns()))
-            && player::seek_preroll_active()
-            && player::finish_paused_seek(&mut self.adapter) {
+        if self.repause_at.is_some_and(|target| {
+            paused_seek_landed(
+                target,
+                player::seek_pending(),
+                player::frames(),
+                player::playpos_ns(),
+            )
+        }) && player::seek_preroll_active()
+            && player::finish_paused_seek(&mut self.adapter)
+        {
             self.repause_at = None;
         }
         let position = player::playpos_ns().max(0) as f64 / 1e9;
@@ -240,17 +263,52 @@ impl Playback {
         }
         if player::pause(&mut self.adapter) {
             self.flush(false);
+        } else {
+            self.sync_error = Some("The player could not pause playback".into());
         }
     }
     pub fn resume(&mut self) {
         if self.completed {
             return;
         }
-        player::resume(&mut self.adapter);
-        self.repause_at = None;
+        if player::resume(&mut self.adapter) {
+            self.repause_at = None;
+        } else {
+            self.sync_error = Some("The player could not resume playback".into());
+        }
+    }
+    pub fn toggle_pause(&mut self) {
+        // Buffering/seeking is not a user pause. Toggle the accepted transport intent,
+        // not the derived Playing state, which is false during clock transitions too.
+        if self.completed {
+            return;
+        }
+        let paused = player::TX.paused.load(std::sync::atomic::Ordering::Acquire);
+        match toggle_transport(paused, |pause| {
+            if pause {
+                player::pause(&mut self.adapter)
+            } else {
+                player::resume(&mut self.adapter)
+            }
+        }) {
+            Ok(true) => self.flush(false),
+            Ok(false) => self.repause_at = None,
+            Err(error) => self.sync_error = Some(error.into()),
+        }
+    }
+    pub fn set_paused(&mut self, paused: bool) {
+        if player::TX.paused.load(std::sync::atomic::Ordering::Acquire) == paused {
+            return;
+        }
+        if paused {
+            self.pause();
+        } else {
+            self.resume();
+        }
     }
     pub fn seek(&mut self, seconds: f64) {
-        if self.completed || !seconds.is_finite() {
+        if self.completed || !seconds.is_finite() || self.adapter.engine().is_none() {
+            self.sync_error = Some("The player could not seek to the selected time".into());
             return;
         }
         let seconds = seconds.max(0.0);
@@ -276,10 +334,16 @@ impl Playback {
                 } else {
                     self.sync_error =
                         Some("Could not restart the scene at the selected time".into());
+                    // No new timeline was accepted. Do not publish seek preroll or
+                    // reset activity accounting to a target that never started.
+                    return;
                 }
             } else {
                 player::request_seek((seconds * 1e9) as i64);
             }
+        } else {
+            self.sync_error = Some("The player could not seek to the selected time".into());
+            return;
         }
         self.last_tick = None;
         if was_paused {
@@ -287,7 +351,9 @@ impl Playback {
             // before the next pump, with the original bounded one-frame seek preroll.
             player::TX.commit_paused(true);
             player::TX.begin_paused_seek();
-            player::TX.resume_pend.store(true, std::sync::atomic::Ordering::Release);
+            player::TX
+                .resume_pend
+                .store(true, std::sync::atomic::Ordering::Release);
             self.repause_at = Some((seconds * 1e9) as i64);
         }
         self.clock = ActivityClock {
@@ -295,9 +361,18 @@ impl Playback {
             ..Default::default()
         };
     }
-    pub fn o_key(&mut self, down: bool) {
+    pub fn o_key(&mut self, down: bool, now_ms: u64) {
+        if down
+            && (self.o_pending
+                || self
+                    .o_last
+                    .is_some_and(|last| now_ms.saturating_sub(last) < 2000))
+        {
+            return;
+        }
         let command = self.history.as_mut().and_then(|h| h.o_key(down));
         if let Some(command) = command {
+            self.o_last = Some(now_ms);
             self.o_pending = true;
             self.send(command);
         }
@@ -391,9 +466,6 @@ impl Playback {
         (!self.completed && self.scene_id.is_some() && player::has_error(&self.session))
             .then(|| player::error_reason(&self.session).to_owned())
     }
-    pub fn audio_track(&mut self, ordinal: i32, codec: &str) {
-        player::request_audio_track(&mut self.session, ordinal, codec);
-    }
     pub fn completed(&self) -> bool {
         self.completed
     }
@@ -402,32 +474,6 @@ impl Playback {
     }
     pub fn o_pending(&self) -> bool {
         self.o_pending
-    }
-    pub fn audio_tracks(&self) -> Vec<String> {
-        player::SHARED
-            .track_names
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .audio
-            .clone()
-    }
-    pub fn subtitle_tracks(&self) -> Vec<String> {
-        player::SHARED
-            .track_names
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .subs
-            .clone()
-    }
-    pub fn selected_audio(&self) -> i32 {
-        player::SHARED
-            .desired_audio_idx
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-    pub fn selected_subtitle(&self) -> i32 {
-        player::SHARED
-            .desired_sub_idx
-            .load(std::sync::atomic::Ordering::Relaxed)
     }
     pub fn select_audio(&mut self, ordinal: i32) {
         let codec = player::SHARED
@@ -438,7 +484,7 @@ impl Playback {
             .get(ordinal.max(0) as usize)
             .cloned();
         if let Some(codec) = codec.filter(|_| ordinal >= 0) {
-            self.audio_track(ordinal, &codec);
+            player::request_audio_track(&mut self.session, ordinal, &codec);
         }
     }
     pub fn subtitle_track(&mut self, ordinal: i32) {
@@ -547,6 +593,71 @@ fn select_stream(scene: &Scene) -> Option<Selected> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[cfg(feature = "hostsim")]
+    fn playback_adapter_respects_native_refusal_and_rejects_unstarted_seeks() {
+        use std::sync::atomic::Ordering;
+        let _guard = crate::testlock::serial();
+        let old_paused = player::TX.paused.load(Ordering::Acquire);
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                player::force_pause_result_for_test(None);
+                player::force_play_result_for_test(None);
+                player::SHARED.reset_hls_clock_for_test();
+                player::TX.commit_paused(self.0);
+            }
+        }
+        let _restore = Restore(old_paused);
+        player::SHARED.reset_hls_clock_for_test();
+        player::TX.commit_paused(false);
+        let mut playback = Playback::new(unsafe { crate::task::MainThread::assume() });
+        player::force_pause_result_for_test(Some(0));
+        playback.toggle_pause();
+        assert!(!player::TX.paused.load(Ordering::Acquire));
+        assert!(playback.sync_error.as_deref().unwrap().contains("pause"));
+        player::force_pause_result_for_test(Some(1));
+        playback.toggle_pause();
+        assert!(player::TX.paused.load(Ordering::Acquire));
+        player::force_play_result_for_test(Some(0));
+        playback.toggle_pause();
+        assert!(player::TX.paused.load(Ordering::Acquire));
+        assert!(playback.sync_error.as_deref().unwrap().contains("resume"));
+        player::force_play_result_for_test(Some(1));
+        playback.toggle_pause();
+        assert!(!player::TX.paused.load(Ordering::Acquire));
+        playback.clock.position = 12.;
+        playback.seek(42.);
+        assert!(playback.sync_error.as_deref().unwrap().contains("seek"));
+        assert_eq!(playback.clock.position, 12.);
+        assert_eq!(playback.repause_at, None);
+    }
+    #[test]
+    fn transport_toggle_uses_user_hold_and_reports_rejected_actuation() {
+        let mut calls = Vec::new();
+        // Derived Playing may be false while buffering/seeking; an unpaused intent
+        // must still call Pause, not Resume. Only an accepted operation changes it.
+        assert_eq!(
+            toggle_transport(false, |pause| {
+                calls.push(pause);
+                true
+            }),
+            Ok(true)
+        );
+        assert_eq!(
+            toggle_transport(true, |pause| {
+                calls.push(pause);
+                true
+            }),
+            Ok(false)
+        );
+        assert!(toggle_transport(false, |pause| {
+            calls.push(pause);
+            false
+        })
+        .is_err());
+        assert_eq!(calls, [true, false, true]);
+    }
     #[test]
     fn natural_completion_flushes_once_and_retains_counter_gate() {
         let mut history = HistoryTracker::new("scene-1".into());

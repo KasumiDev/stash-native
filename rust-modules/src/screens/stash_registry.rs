@@ -76,10 +76,6 @@ pub struct PlaybackView {
     pub o_count: i64,
     pub o_pending: bool,
     pub error: String,
-    pub audio: Vec<String>,
-    pub subtitles: Vec<String>,
-    pub selected_audio: i32,
-    pub selected_subtitle: i32,
 }
 #[derive(Default)]
 pub struct Init;

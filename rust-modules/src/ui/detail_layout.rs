@@ -103,6 +103,29 @@ pub(crate) fn hero_chain(
     HeroChain { meta_y, ratings_y, syn_y, facts_y, btn_y }
 }
 
+/// A detail hero whose identity and reading blocks may be absent. Missing blocks own neither
+/// height nor a gap; the remaining rows retain the shared measured hero grammar.
+pub(crate) fn hero_chain_optional(
+    meta_h: Option<f32>,
+    syn_h: Option<f32>,
+    measure: &dyn crate::ui::machine::Measure,
+) -> HeroChain {
+    let meta_y = TITLE_BOTTOM + theme::space::SM;
+    let syn_y = meta_h.map_or(meta_y, |h| meta_y + h + theme::space::SM);
+    let facts_y = syn_h.map_or_else(
+        || meta_h.map_or(meta_y, |h| meta_y + h + theme::space::MD),
+        |h| syn_y + h + theme::space::MD,
+    );
+    let btn_y = facts_y + measure.cap_h(theme::size::CAPTION) + theme::space::LG;
+    HeroChain {
+        meta_y,
+        ratings_y: syn_y,
+        syn_y,
+        facts_y,
+        btn_y,
+    }
+}
+
 pub(crate) fn people_top(btn_y: f32, lines: usize) -> f32 {
     btn_y + widgets::StatusOverlay::CTRL_H - lines as f32 * PEOPLE_LEAD
 }
@@ -126,6 +149,30 @@ pub(crate) fn overscan_rects(out: &mut Vec<(&'static str, Rect)>) {
 mod tests {
     use super::*;
     use crate::ui::machine::Measure;
+
+    #[test]
+    fn optional_hero_blocks_use_only_present_measured_heights_and_gaps() {
+        let m = crate::ui::fixture::FixtureMeasure;
+        let empty = hero_chain_optional(None, None, &m);
+        assert_eq!(empty.facts_y, TITLE_BOTTOM + theme::space::SM);
+        let studio = hero_chain_optional(Some(m.cap_h(theme::size::BODY)), None, &m);
+        assert_eq!(
+            studio.facts_y,
+            studio.meta_y + m.cap_h(theme::size::BODY) + theme::space::MD
+        );
+        let prose = hero_chain_optional(None, Some(90.), &m);
+        assert_eq!(prose.syn_y, empty.facts_y);
+        assert_eq!(prose.facts_y, prose.syn_y + 90. + theme::space::MD);
+        let full = hero_chain_optional(Some(34.), Some(90.), &m);
+        assert_eq!(full.syn_y, full.meta_y + 34. + theme::space::SM);
+        assert_eq!(full.facts_y, full.syn_y + 90. + theme::space::MD);
+        for chain in [empty, studio, prose, full] {
+            assert_eq!(
+                chain.btn_y,
+                chain.facts_y + m.cap_h(theme::size::CAPTION) + theme::space::LG
+            );
+        }
+    }
 
     /// The facts row and the people column are LEVEL, so the thing that keeps them apart is a
     /// width bound and nothing else.

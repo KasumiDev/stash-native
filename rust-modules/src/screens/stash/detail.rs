@@ -37,7 +37,7 @@ impl SceneDetailScreen {
         TextView::new(
             self.content
                 .scene()
-                .and_then(|s| s.details.as_deref())
+                .and_then(|s| nonempty(s.details.as_deref()))
                 .unwrap_or(""),
             theme::size::BODY,
             theme::TEXT_SECONDARY,
@@ -46,8 +46,15 @@ impl SceneDetailScreen {
         .max_lines(3)
     }
     fn chain(&self, cx: &Cx<'_, StashHost>) -> detail_layout::HeroChain {
-        let mut chain =
-            detail_layout::hero_chain(self.synopsis(cx).measure_h(HERO_TEXT_W), false, cx.measure);
+        let scene = self.content.scene();
+        let meta_h = scene
+            .and_then(|s| s.studio.as_ref())
+            .and_then(|s| nonempty(Some(&s.name)))
+            .map(|_| cx.measure.cap_h(theme::size::BODY));
+        let syn_h = scene
+            .and_then(|s| nonempty(s.details.as_deref()))
+            .map(|_| self.synopsis(cx).measure_h(HERO_TEXT_W));
+        let mut chain = detail_layout::hero_chain_optional(meta_h, syn_h, cx.measure);
         if let Some(scene) = self.content.scene() {
             let tags = self.tags(cx, scene);
             if !tags.items.is_empty() {
@@ -162,48 +169,60 @@ impl SceneDetailScreen {
             ),
         );
         let chain = self.chain(f.cx);
-        let metadata = scene.studio.as_ref().map(|s| s.name.as_str()).unwrap_or("");
+        if let Some(metadata) = scene.studio.as_ref().and_then(|s| nonempty(Some(&s.name))) {
+            line(
+                p,
+                metadata,
+                Rect::new(
+                    MARGIN_X,
+                    chain.meta_y - scroll,
+                    HERO_TEXT_W,
+                    f.cx.measure.cap_h(theme::size::BODY),
+                ),
+                theme::size::BODY,
+                theme::TEXT_SECONDARY,
+            );
+        }
+        if nonempty(scene.details.as_deref()).is_some() {
+            self.synopsis(f.cx).draw(
+                p,
+                Rect::new(MARGIN_X, chain.syn_y - scroll, HERO_TEXT_W, 0.),
+            );
+        }
+        let facts = facts_text(scene);
+        let leading = if facts.is_empty() {
+            String::new()
+        } else {
+            format!("{facts} · ")
+        };
+        let facts_h = f.cx.measure.cap_h(theme::size::CAPTION);
+        let facts_w =
+            f.cx.measure
+                .width_str(&leading, theme::size::CAPTION, false);
+        let facts_y = chain.facts_y - scroll;
+        if !leading.is_empty() {
+            line(
+                p,
+                &leading,
+                Rect::new(MARGIN_X, facts_y, facts_w, facts_h),
+                theme::size::CAPTION,
+                detail_layout::FACTS_INK,
+            );
+        }
+        crate::ui::icons::draw(
+            p,
+            crate::ui::icons::Icon::Droplets,
+            Rect::new(MARGIN_X + facts_w, facts_y, facts_h, facts_h),
+            detail_layout::FACTS_INK,
+        );
         line(
             p,
-            metadata,
+            &scene.o_counter.max(0).to_string(),
             Rect::new(
-                MARGIN_X,
-                chain.meta_y - scroll,
-                HERO_TEXT_W,
-                crate::ui::widgets::BADGE_H,
-            ),
-            theme::size::BODY,
-            theme::TEXT_SECONDARY,
-        );
-        self.synopsis(f.cx).draw(
-            p,
-            Rect::new(MARGIN_X, chain.syn_y - scroll, HERO_TEXT_W, 0.),
-        );
-        let file = scene.files.first();
-        let duration = file.map(|s| s.duration).unwrap_or(0.);
-        let facts = format!(
-            "{} · {}:{:02} · {} {}{}",
-            scene.date.as_deref().unwrap_or(""),
-            (duration / 60.) as u32,
-            (duration % 60.) as u32,
-            crate::i18n::msg::stash_detail_o_count(),
-            scene.o_counter,
-            file.map(|s| format!(
-                " · {}p · {} / {}",
-                s.height,
-                s.video_codec.to_uppercase(),
-                s.audio_codec.to_uppercase()
-            ))
-            .unwrap_or_default()
-        );
-        line(
-            p,
-            &facts,
-            Rect::new(
-                MARGIN_X,
-                chain.facts_y - scroll,
-                HERO_TEXT_W,
-                f.cx.measure.cap_h(theme::size::CAPTION),
+                MARGIN_X + facts_w + facts_h + theme::space::XS,
+                facts_y,
+                HERO_TEXT_W - facts_w - facts_h - theme::space::XS,
+                facts_h,
             ),
             theme::size::CAPTION,
             detail_layout::FACTS_INK,
@@ -253,6 +272,21 @@ impl SceneDetailScreen {
             }
         }
     }
+}
+fn nonempty(text: Option<&str>) -> Option<&str> {
+    text.map(str::trim).filter(|s| !s.is_empty())
+}
+fn facts_text(scene: &Scene) -> String {
+    let duration = scene
+        .files
+        .first()
+        .map(|file| file.duration)
+        .filter(|v| v.is_finite() && *v > 0.);
+    crate::ui::widgets::scene_caption(
+        nonempty(scene.date.as_deref()).unwrap_or(""),
+        duration,
+        None,
+    )
 }
 fn cs(text: &str) -> CString {
     CString::new(text.replace('\0', "")).unwrap()
@@ -366,6 +400,90 @@ mod tests {
             owner: InputOwner::Entry(EntryId(1)),
         });
     }
+    #[test]
+    fn facts_keep_available_date_and_duration_without_technical_fields_or_empty_separators() {
+        let mut scene = Scene {
+            date: Some(" 2026-10-01 ".into()),
+            o_counter: 0,
+            files: vec![crate::stash::SceneFile {
+                duration: 3723.,
+                height: 2160,
+                video_codec: "HEVC".into(),
+                audio_codec: "AAC".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(facts_text(&scene), "2026-10-01 · 1:02:03");
+        scene.date = Some(" \t ".into());
+        assert_eq!(facts_text(&scene), "1:02:03");
+        for duration in [0., -1., f64::NAN, f64::INFINITY] {
+            scene.files[0].duration = duration;
+            assert_eq!(facts_text(&scene), "");
+            scene.date = Some("2026-10-01".into());
+            assert_eq!(facts_text(&scene), "2026-10-01");
+            scene.date = None;
+        }
+        scene.files.clear();
+        assert_eq!(facts_text(&scene), "");
+        assert_eq!(
+            scene.o_counter, 0,
+            "Missing facts must not remove the separate zero count"
+        );
+        assert_eq!(nonempty(Some("\n \t")), None);
+    }
+
+    #[test]
+    fn empty_identity_and_synopsis_reclaim_their_measured_space() {
+        let _lock = crate::testlock::serial();
+        context(|cx| {
+            let chain_for = |studio: &str, details: &str| {
+                let mut screen = SceneDetailScreen::new("42".into(), EntryId(1));
+                let mut out = Vec::new();
+                let mut present = crate::ui::present::Present::new();
+                let mut fx =
+                    Effects::new(&mut out, MachineId::Instance(InstanceId(1)), &mut present);
+                screen.step(&ScreenEvent::Mount, cx, &mut fx);
+                screen.step(
+                    &ScreenEvent::Async(
+                        RequestId(1),
+                        StashMsg::Loaded {
+                            generation: 1,
+                            result: Ok(PageData {
+                                scene: Some(Scene {
+                                    id: "42".into(),
+                                    studio: Some(crate::stash::Studio {
+                                        name: studio.into(),
+                                        ..Default::default()
+                                    }),
+                                    details: Some(details.into()),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }),
+                        },
+                    ),
+                    cx,
+                    &mut fx,
+                );
+                screen.chain(cx)
+            };
+            let full = chain_for("Studio", "A scene description.");
+            let no_studio = chain_for(" \t ", "A scene description.");
+            let no_description = chain_for("Studio", "\n \t");
+            let empty = chain_for(" \t", "\n ");
+            assert!(
+                no_studio.btn_y < full.btn_y,
+                "Empty Studio must reclaim its height and gap"
+            );
+            assert!(
+                no_description.btn_y < full.btn_y,
+                "Empty Description must reclaim its height and gap"
+            );
+            assert!(empty.btn_y < no_studio.btn_y.min(no_description.btn_y));
+        });
+    }
+
     #[test]
     fn arriving_metadata_seats_play_and_resume_restart_keep_scene_identity() {
         let _lock = crate::testlock::serial();

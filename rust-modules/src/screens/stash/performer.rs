@@ -9,7 +9,7 @@ use crate::ui::machine::*;
 use crate::ui::screen::*;
 use crate::ui::text_view::TextView;
 use crate::ui::widgets::Button;
-use crate::ui::{theme, Env, Rect, View};
+use crate::ui::{theme, Env, Rect, Spring, View};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
@@ -71,6 +71,7 @@ pub struct PerformerScreen {
     tags_started: bool,
     tags_error: bool,
     hero_seated: bool,
+    pinned_alpha: Spring,
 }
 impl PerformerScreen {
     pub fn new(id: String, entry: EntryId) -> Self {
@@ -86,6 +87,7 @@ impl PerformerScreen {
             tags_started: false,
             tags_error: false,
             hero_seated: false,
+            pinned_alpha: Spring::at(0.),
         }
     }
     fn request_tags(&mut self, fx: &mut Effects<'_, StashHost>) {
@@ -168,6 +170,22 @@ impl PerformerScreen {
             + theme::space::SM;
         let actions = last.max(top + PORTRAIT_H) + theme::space::LG;
         (description, facts, models, popular, actions)
+    }
+    fn header_target(&self, cx: &Cx<'_, StashHost>) -> f32 {
+        let hero_bottom = self.layout(cx).4 + crate::ui::widgets::StatusOverlay::CTRL_H;
+        f32::from(
+            hero_content::collapse_fraction(
+                self.content.scroll(),
+                hero_bottom - crate::ui::widgets::TOP_BAR_BOTTOM,
+            ) > 0.,
+        )
+    }
+    fn header_clearance(&self, cx: &Cx<'_, StashHost>) -> f32 {
+        if self.pinned_alpha.pos > 0.01 {
+            hero_content::pinned_name_bottom(cx.measure)
+        } else {
+            0.
+        }
     }
     fn rect(&self, cx: &Cx<'_, StashHost>) -> Rect {
         let label = crate::i18n::msg::browse_stash_scenes_c();
@@ -331,17 +349,11 @@ impl Machine<StashHost> for PerformerScreen {
         self.content.detail_inset(
             self.layout(cx).4 + crate::ui::widgets::StatusOverlay::CTRL_H + theme::space::XL,
         );
-        let collapsed =
-            hero_content::collapse_fraction(self.content.scroll(), self.layout(cx).4) > 0.;
-        self.content.hit_clearance(if collapsed {
-            hero_content::pinned_name_bottom(cx.measure)
-        } else {
-            0.
-        });
+        self.content.hit_clearance(self.header_clearance(cx));
         let images = self
             .content
             .performer()
-            .filter(|_| self.content.scroll() < self.layout(cx).4)
+            .filter(|_| self.header_target(cx) < 0.5)
             .and_then(|p| {
                 p.image_path.as_ref().map(|url| {
                     vec![
@@ -407,6 +419,18 @@ impl Machine<StashHost> for PerformerScreen {
             _ => {}
         }
         let result = self.content.step(event, cx, fx);
+        if let ScreenEvent::Tick(t) = event {
+            let target = self.header_target(cx);
+            self.pinned_alpha
+                .step(target, crate::ui::consts::K_SNAP, t.dt());
+            if (self.pinned_alpha.pos - target).abs() < 0.002 && self.pinned_alpha.vel.abs() < 0.01
+            {
+                self.pinned_alpha.jump(target);
+            } else {
+                fx.invalidate(crate::ui::present::Provenance::Input);
+            }
+        }
+        self.content.hit_clearance(self.header_clearance(cx));
         if !self.hero_seated && self.content.performer().is_some() {
             self.hero_seated = true;
             self.content.shelf_scroll(0.);
@@ -458,10 +482,10 @@ impl Screen<StashHost> for PerformerScreen {
         }
     }
     fn draw(&mut self, f: &mut DrawFrame<'_, '_, StashHost>) {
-        let collapse = hero_content::collapse_fraction(self.content.scroll(), self.layout(f.cx).4);
+        let collapse = self.pinned_alpha.pos.clamp(0., 1.);
         if let Some(performer) = self.content.performer() {
             let scroll = self.content.scroll();
-            let a = (1. - scroll / self.layout(f.cx).4).clamp(0., 1.);
+            let a = 1.;
             let p = f.painter.alpha(a);
             if let Some(&(texture, w, h)) =
                 f.cx.views
@@ -507,12 +531,8 @@ impl Screen<StashHost> for PerformerScreen {
             self.title(f.cx).draw(
                 p,
                 Rect::new(
-                    TEXT_X + (MARGIN_X - TEXT_X) * collapse,
-                    hero_content::pinned_title_y(
-                        crate::ui::widgets::TOP_BAR_BOTTOM + theme::space::XL,
-                        scroll,
-                        crate::ui::widgets::TOP_BAR_BOTTOM + theme::space::MD,
-                    ),
+                    TEXT_X,
+                    crate::ui::widgets::TOP_BAR_BOTTOM + theme::space::XL - scroll,
                     TEXT_W,
                     0.,
                 ),
@@ -563,7 +583,7 @@ impl Screen<StashHost> for PerformerScreen {
                         key,
                         rect,
                         rest_rect: rect,
-                        clip: if collapse > 0. {
+                        clip: if collapse > 0.01 {
                             Rect::new(
                                 0.,
                                 hero_content::pinned_name_bottom(f.cx.measure),
@@ -598,7 +618,7 @@ impl Screen<StashHost> for PerformerScreen {
                         key,
                         rect,
                         rest_rect: rect,
-                        clip: if collapse > 0. {
+                        clip: if collapse > 0.01 {
                             Rect::new(
                                 0.,
                                 hero_content::pinned_name_bottom(f.cx.measure),
@@ -803,5 +823,36 @@ mod tests {
         assert_eq!(screen.top.len(), 1);
         assert!(!screen.loading_tags);
         assert_eq!(screen.layout(&cx).4, height);
+        let boundary =
+            height + crate::ui::widgets::StatusOverlay::CTRL_H - crate::ui::widgets::TOP_BAR_BOTTOM;
+        screen.content.shelf_scroll(boundary - 1.);
+        assert_eq!(screen.header_target(&cx), 0.);
+        assert_eq!(screen.header_clearance(&cx), 0.);
+        screen.content.shelf_scroll(boundary + 1.);
+        assert_eq!(screen.header_target(&cx), 1.);
+        assert_eq!(screen.header_clearance(&cx), 0.); // The separate header has not painted yet.
+        screen.step(
+            &ScreenEvent::Tick(Tick {
+                ms: 16,
+                dt_us: 16_667,
+            }),
+            &cx,
+            &mut fx,
+        );
+        assert!(screen.pinned_alpha.pos > 0.);
+        assert!(screen.header_clearance(&cx) > crate::ui::widgets::TOP_BAR_BOTTOM);
+        screen.content.shelf_scroll(0.);
+        for frame in 1..120 {
+            screen.step(
+                &ScreenEvent::Tick(Tick {
+                    ms: frame * 16,
+                    dt_us: 16_667,
+                }),
+                &cx,
+                &mut fx,
+            );
+        }
+        assert_eq!(screen.pinned_alpha.pos, 0.);
+        assert_eq!(screen.header_clearance(&cx), 0.);
     }
 }

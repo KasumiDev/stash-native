@@ -171,12 +171,9 @@ impl PassiveBadges {
     }
 }
 
-/// The title's document anchor approaches a fixed band below navigation as the hero collapses.
-pub(crate) fn pinned_title_y(expanded_top: f32, scroll: f32, pinned_top: f32) -> f32 {
-    (expanded_top - scroll).max(pinned_top)
-}
+/// Header visibility begins only after the complete document hero passes below-navigation.
 pub(crate) fn collapse_fraction(scroll: f32, extent: f32) -> f32 {
-    (scroll / extent.max(1.)).clamp(0., 1.)
+    ((scroll - extent) / theme::space::LG).clamp(0., 1.)
 }
 pub(crate) fn pinned_name_bottom(measure: &dyn Measure) -> f32 {
     super::widgets::TOP_BAR_BOTTOM
@@ -241,11 +238,16 @@ mod tests {
         assert!(badges.items.iter().all(|b| b.rect.x + b.rect.w <= 640.));
     }
     #[test]
+    fn performer_header_stays_hidden_until_the_entire_hero_leaves() {
+        assert_eq!(collapse_fraction(100., 400.), 0.);
+        assert_eq!(collapse_fraction(400., 400.), 0.);
+        assert_eq!(collapse_fraction(450., 400.), 1.);
+    }
+    #[test]
     fn collapse_pins_the_name_and_reverses_with_scroll() {
-        assert_eq!(pinned_title_y(320., 0., 180.), 320.);
-        assert_eq!(pinned_title_y(320., 100., 180.), 220.);
-        assert_eq!(pinned_title_y(320., 500., 180.), 180.);
-        assert_eq!(pinned_title_y(320., 0., 180.), 320.);
+        assert_eq!(collapse_fraction(0., 400.), 0.);
+        assert_eq!(collapse_fraction(450., 400.), 1.);
+        assert_eq!(collapse_fraction(0., 400.), 0.);
         assert_eq!(collapse_fraction(500., 400.), 1.);
     }
 }

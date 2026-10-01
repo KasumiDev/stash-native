@@ -23,6 +23,10 @@ pub struct HomeScreen {
     scroll_target: f32,
     auto_at: u32,
     covered: bool,
+    outgoing: Option<crate::stash::Scene>,
+    slide: Spring,
+    direction: f32,
+    flip_cooldown: f32,
 }
 impl HomeScreen {
     pub fn new(entry: EntryId) -> Self {
@@ -37,6 +41,10 @@ impl HomeScreen {
             scroll_target: 0.,
             auto_at: 0,
             covered: false,
+            outgoing: None,
+            slide: Spring::at(1.),
+            direction: 1.,
+            flip_cooldown: 0.,
         }
     }
     fn scene(&self) -> Option<&crate::stash::Scene> {
@@ -54,7 +62,9 @@ impl HomeScreen {
         }
     }
     fn rects(&self, cx: &Cx<'_, StashHost>) -> [Rect; 2] {
-        let label = self.play_label();
+        self.rects_for(cx, self.play_label())
+    }
+    fn rects_for(&self, cx: &Cx<'_, StashHost>, label: &std::ffi::CStr) -> [Rect; 2] {
         let w = cx.measure.width(label, theme::size::BODY, true) + 96.;
         let y = landing_hero::TEXT_BOTTOM + theme::space::MD - self.snap.pos * SNAP_EXTENT;
         [
@@ -72,7 +82,11 @@ impl HomeScreen {
     }
     fn flip(&mut self, delta: i32, now: u32) {
         let n = self.shelves.scenes().len();
-        if n > 0 {
+        if n > 1 && self.flip_cooldown <= 0. {
+            self.outgoing = self.scene().cloned();
+            self.direction = delta.signum() as f32;
+            crate::ui::hero_transition::begin(&mut self.slide);
+            self.flip_cooldown = crate::ui::hero_transition::FLIP_COOLDOWN;
             self.index = (self.index as i32 + delta).rem_euclid(n as i32) as usize;
             self.selected = self.scene().map(|s| s.id.clone());
             self.auto_at = now;
@@ -159,6 +173,13 @@ impl Focusable<StashHost> for HomeScreen {
     fn place(&self, key: &u32, cx: &Cx<'_, StashHost>, at: At) -> Option<Placed> {
         if (HERO..HERO + 2).contains(key) {
             self.hero(cx, |g| g.place(&(*key - HERO), cx, at))
+                .map(|mut placed| {
+                    if matches!(at, At::Drawn) && self.outgoing.is_some() {
+                        placed.rect.x +=
+                            crate::ui::hero_transition::offsets(&self.slide, self.direction).1;
+                    }
+                    placed
+                })
         } else {
             self.shelves.place(key, cx, at)
         }
@@ -215,7 +236,8 @@ impl Machine<StashHost> for HomeScreen {
             {
                 self.flip(if *key == Key::Left { -1 } else { 1 }, cx.tick.ms);
                 fx.invalidate(crate::ui::present::Provenance::Input);
-                self.shelves.media_override(Vec::new(), self.hero_preview());
+                self.shelves
+                    .media_override(self.hero_images(), self.hero_preview());
                 return Handled::Yes;
             }
             ScreenEvent::Input(_) => self.auto_at = cx.tick.ms,
@@ -242,6 +264,13 @@ impl Machine<StashHost> for HomeScreen {
                 self.auto_at = cx.tick.ms;
             }
             ScreenEvent::Tick(t) => {
+                self.flip_cooldown = (self.flip_cooldown - t.dt()).max(0.);
+                if self.outgoing.is_some() && !self.covered {
+                    if crate::ui::hero_transition::step(&mut self.slide, t.dt()) {
+                        self.outgoing = None;
+                    }
+                    fx.invalidate(crate::ui::present::Provenance::Input);
+                }
                 self.snap
                     .step(self.target, crate::ui::consts::K_SNAP, t.dt());
                 self.scroll
@@ -261,7 +290,8 @@ impl Machine<StashHost> for HomeScreen {
             }
             _ => {}
         }
-        self.shelves.media_override(Vec::new(), self.hero_preview());
+        self.shelves
+            .media_override(self.hero_images(), self.hero_preview());
         let result = self.shelves.step(event, cx, fx);
         if matches!(result, Handled::Yes)
             && matches!(event, ScreenEvent::Async(_, StashMsg::Loaded { .. }))
@@ -278,6 +308,21 @@ impl Machine<StashHost> for HomeScreen {
     }
 }
 impl HomeScreen {
+    fn hero_images(&self) -> Vec<(String, String)> {
+        if self.covered || self.target >= 0.5 {
+            return Vec::new();
+        }
+        self.outgoing
+            .as_ref()
+            .and_then(|s| {
+                s.paths
+                    .screenshot
+                    .as_ref()
+                    .map(|url| (format!("hero:{}", s.id), url.clone()))
+            })
+            .into_iter()
+            .collect()
+    }
     fn hero_preview(&self) -> Option<(String, String)> {
         if self.covered || self.target >= 0.5 {
             return None;
@@ -338,14 +383,45 @@ impl Screen<StashHost> for HomeScreen {
         }
     }
     fn draw(&mut self, f: &mut DrawFrame<'_, '_, StashHost>) {
+        if let Some(old) = self.outgoing.as_ref() {
+            let (outgoing, incoming) =
+                crate::ui::hero_transition::offsets(&self.slide, self.direction);
+            self.draw_billboard(f, Some(old), outgoing, false);
+            self.draw_billboard(f, self.scene(), incoming, true);
+        } else {
+            self.draw_billboard(f, self.scene(), 0., true);
+        }
+        if !self.shelves.scenes().is_empty() {
+            PageDots::new(self.shelves.scenes().len())
+                .active(self.index)
+                .centered_at(960., self.rects(f.cx)[0].y + 84.)
+                .draw(
+                    &Env::inert(),
+                    f.painter.alpha(crate::ui::hero_alpha(self.snap.pos, 0.8)),
+                );
+        }
+        self.shelves.draw(f);
+    }
+}
+impl HomeScreen {
+    fn draw_billboard(
+        &self,
+        f: &mut DrawFrame<'_, '_, StashHost>,
+        scene: Option<&crate::stash::Scene>,
+        dx: f32,
+        live: bool,
+    ) {
         let a = crate::ui::hero_alpha(self.snap.pos, 0.8);
-        let p = f.painter;
-        if let Some(scene) = self.scene() {
-            if let Some((tex, w, h)) =
-                f.cx.views
-                    .textures
-                    .get(&format!("preview:hero:{}", scene.id))
-                    .or_else(|| f.cx.views.textures.get(&format!("hero:{}", scene.id)))
+        let p = f.painter.translate(dx, 0.);
+        if let Some(scene) = scene {
+            if let Some((tex, w, h)) = live
+                .then(|| {
+                    f.cx.views
+                        .textures
+                        .get(&format!("preview:hero:{}", scene.id))
+                })
+                .flatten()
+                .or_else(|| f.cx.views.textures.get(&format!("hero:{}", scene.id)))
             {
                 p.alpha(a).tex_uv(
                     *tex,
@@ -423,26 +499,36 @@ impl Screen<StashHost> for HomeScreen {
         }
         let hero = p.alpha(a);
         let env = Env::inert();
-        let rects = self.rects(f.cx);
-        let label = self.play_label();
-        let count = if self.scene().is_some() { 2 } else { 1 };
+        let label = if !live {
+            if scene.is_some_and(|s| s.resume_time > 0.) {
+                crate::i18n::msg::browse_home_continue_c()
+            } else {
+                crate::i18n::msg::browse_detail_play_c()
+            }
+        } else {
+            self.play_label()
+        };
+        let rects = self.rects_for(f.cx, label);
+        let count = if scene.is_some() { 2 } else { 1 };
         for (i, rect) in rects.into_iter().take(count).enumerate() {
             let key = FocusKey {
                 entry: self.entry,
                 elem: HERO + i as u32,
             };
-            let focused = f.cx.focus.current == Some(key);
-            f.stop(
-                p,
-                Stop {
-                    key,
-                    rect,
-                    rest_rect: rect,
-                    clip: Rect::FULL,
-                    hover: Hover::Focus,
-                    activate: Activate::Press,
-                },
-            );
+            let focused = live && f.cx.focus.current == Some(key);
+            if live {
+                f.stop(
+                    p,
+                    Stop {
+                        key,
+                        rect,
+                        rest_rect: rect,
+                        clip: Rect::FULL,
+                        hover: Hover::Focus,
+                        activate: Activate::Press,
+                    },
+                );
+            }
             if i == 0 {
                 Button::new(label.as_ptr(), theme::size::BODY, rect)
                     .icon(Icon::Play)
@@ -457,13 +543,6 @@ impl Screen<StashHost> for HomeScreen {
                     .draw(&env, hero);
             }
         }
-        if !self.shelves.scenes().is_empty() {
-            PageDots::new(self.shelves.scenes().len())
-                .active(self.index)
-                .centered_at(960., rects[0].y + 84.)
-                .draw(&env, hero);
-        }
-        self.shelves.draw(f);
     }
 }
 #[cfg(test)]
@@ -617,7 +696,23 @@ mod tests {
         );
         home.flip(-1, 20);
         assert_eq!(home.scene().unwrap().id, "12");
-        home.flip(1, 30);
+        assert_eq!(home.outgoing.as_ref().unwrap().id, "1");
+        assert_eq!(
+            home.hero_preview(),
+            Some(("hero:12".into(), "fixture://preview/12".into()))
+        );
+        assert_eq!(
+            home.place(&HERO, &cx, At::Drawn).unwrap().rect.x,
+            home.rects(&cx)[0].x - crate::ui::consts::SCR_W
+        );
+        assert_eq!(
+            home.place(&HERO, &cx, At::SpringTarget).unwrap().rect.x,
+            home.rects(&cx)[0].x
+        );
+        home.flip(-1, 21);
+        assert_eq!(home.scene().unwrap().id, "12");
+        home.flip_cooldown = 0.;
+        home.flip(1, 400);
         assert_eq!(home.scene().unwrap().id, "1");
         home.covered = true;
         assert_eq!(home.hero_preview(), None);

@@ -83,13 +83,6 @@ fn fixture_playback(route: &str) -> Option<PlaybackView> {
         playing: true,
         completed: route == "ended",
         o_count: 7,
-        audio: vec![
-            "English · AAC · Stereo".into(),
-            "French · AAC · Stereo".into(),
-        ],
-        subtitles: vec!["English · SRT".into(), "French · SRT".into()],
-        selected_audio: 0,
-        selected_subtitle: -1,
         ..Default::default()
     })
 }
@@ -257,20 +250,35 @@ fn fixture_texture(key: &str, phase: u32, old: u32) -> u32 {
         }
     }
     if key.starts_with("blur:") {
-        if let Some(image)=image::RgbaImage::from_raw(w as u32,h as u32,pixels.clone()) {
-            pixels=image::imageops::blur(&image,12.).into_raw();
+        if let Some(image) = image::RgbaImage::from_raw(w as u32, h as u32, pixels.clone()) {
+            pixels = image::imageops::blur(&image, 12.).into_raw();
         }
     }
     crate::gfx::upload_rgba(old, w as i32, h as i32, pixels.as_ptr())
 }
 fn fixture_dimensions(key: &str) -> (usize, usize) {
-    if key.contains("performer:") { (96, 144) }
-    else if key.contains("scene:") {
-        let id=key.rsplit(':').next().and_then(|id|id.parse::<usize>().ok()).unwrap_or(1);
-        if id%7==0 {(320,90)} else if id%5==0 {(144,144)} else if id%3==0 {(90,160)} else {(160,90)}
+    if key.contains("performer:") {
+        (96, 144)
+    } else if key.contains("scene:") {
+        let id = key
+            .rsplit(':')
+            .next()
+            .and_then(|id| id.parse::<usize>().ok())
+            .unwrap_or(1);
+        if id % 7 == 0 {
+            (320, 90)
+        } else if id % 5 == 0 {
+            (144, 144)
+        } else if id % 3 == 0 {
+            (90, 160)
+        } else {
+            (160, 90)
+        }
+    } else if key.starts_with("tag:") {
+        (128, 128)
+    } else {
+        (160, 90)
     }
-    else if key.starts_with("tag:") { (128, 128) }
-    else { (160, 90) }
 }
 fn scene_boot_route(route: &str) -> Option<StashArg> {
     route
@@ -497,6 +505,14 @@ unsafe fn run_inner() -> c_int {
                 .present
                 .note(crate::ui::present::PresentEvent::Damage(Provenance::Input));
         }
+        if let Some(key) = rig.media.failed_preview() {
+            if let Some((texture, _, _)) = rig.textures.remove(key) {
+                crate::gfx::delete_tex(texture);
+                dispatcher
+                    .present
+                    .note(crate::ui::present::PresentEvent::Damage(Provenance::Input));
+            }
+        }
         let previous_o_count = playback.o_count;
         playback.tick(now as u64);
         if playback.o_count != previous_o_count {
@@ -527,10 +543,6 @@ unsafe fn run_inner() -> c_int {
                 .or_else(|| playback_error.clone())
                 .or_else(|| playback.sync_error.clone())
                 .unwrap_or_default(),
-            audio: playback.audio_tracks(),
-            subtitles: playback.subtitle_tracks(),
-            selected_audio: playback.selected_audio(),
-            selected_subtitle: playback.selected_subtitle(),
         };
         #[cfg(feature = "hostsim")]
         if let Some(view) = fixture_playback(&fixture_route) {
@@ -645,18 +657,13 @@ unsafe fn run_inner() -> c_int {
                         }
                     }
                     Action::SeekTo(position) => playback.seek(position),
+                    Action::Pause => playback.toggle_pause(),
+                    Action::SetPaused(paused) => playback.set_paused(paused),
                     Action::AudioTrack(ordinal) => playback.select_audio(ordinal),
                     Action::SubtitleTrack(ordinal) => playback.subtitle_track(ordinal),
-                    Action::Pause => {
-                        if playback.playing() {
-                            playback.pause()
-                        } else {
-                            playback.resume()
-                        }
-                    }
                     Action::AddO => {
-                        playback.o_key(true);
-                        playback.o_key(false);
+                        playback.o_key(true, now as u64);
+                        playback.o_key(false, now as u64);
                     }
                     Action::Open(_) => playback.stop(),
                     _ => {}
@@ -773,6 +780,7 @@ mod tests {
         textures: HashMap<String, (u32, f32, f32)>,
         work: Vec<(Addr, crate::stores::stash::Work)>,
         playback: PlaybackView,
+        actions: Vec<Action>,
     }
     impl Rig<StashHost> for TestRig {
         fn split(&mut self) -> Split<'_, StashHost> {
@@ -810,8 +818,10 @@ mod tests {
             _: &CxParts<u32>,
             _: &mut Effects<'_, StashHost>,
         ) {
-            if let StashFx::Work(addr, work) = fx {
-                self.work.push((addr, work));
+            match fx {
+                StashFx::Work(addr, work) => self.work.push((addr, work)),
+                StashFx::Player(action) => self.actions.push(action),
+                _ => {}
             }
         }
         fn log(&mut self, _: &str) {}
@@ -832,6 +842,7 @@ mod tests {
             textures: HashMap::new(),
             work: Vec::new(),
             playback: PlaybackView::default(),
+            actions: Vec::new(),
         };
         let mut dispatcher = Dispatcher::<StashHost>::new();
         dispatcher.request(MachineId::Nav, NavOp::Root(StashArg::Scenes));
@@ -1023,6 +1034,111 @@ mod tests {
         );
     }
     #[test]
+    fn player_keyboard_release_commits_pause_and_marker_seek_once() {
+        let _lock = crate::testlock::serial();
+        let mut rig = TestRig {
+            mount: Mount,
+            config: Config::default(),
+            textures: HashMap::new(),
+            work: Vec::new(),
+            actions: Vec::new(),
+            playback: PlaybackView {
+                scene: Some(crate::stash::Scene {
+                    scene_markers: vec![crate::stash::SceneMarker {
+                        id: "test-marker".into(),
+                        seconds: 42.,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                playing: true,
+                duration: 120.,
+                ..Default::default()
+            },
+        };
+        let mut dispatcher = Dispatcher::<StashHost>::new();
+        dispatcher.request(MachineId::Nav, NavOp::Root(StashArg::Player("1".into())));
+        let mut ms = 1000;
+        let mut frame =
+            |d: &mut Dispatcher<StashHost>, r: &mut TestRig, key: Option<(Key, Edge)>| {
+                ms += 32;
+                let at = Tick { ms, dt_us: 32000 };
+                let inputs = key
+                    .map(|(key, edge)| InputEvent {
+                        at,
+                        source: Source::Script,
+                        kind: InputKind::Key {
+                            key,
+                            edge,
+                            sym: 0,
+                            wcode: 0,
+                            at_edge: false,
+                        },
+                    })
+                    .into_iter()
+                    .collect();
+                d.frame_with(r, at, inputs, Vec::new(), &mut NoTap, false);
+            };
+        frame(&mut dispatcher, &mut rig, None);
+        assert_eq!(dispatcher.focus().unwrap().elem, 0);
+        for key in [
+            Some((Key::Ok, Edge::Down)),
+            Some((Key::Ok, Edge::Repeat)),
+            Some((Key::Ok, Edge::Up)),
+        ] {
+            frame(&mut dispatcher, &mut rig, key);
+        }
+        for _ in 0..20 {
+            frame(&mut dispatcher, &mut rig, None);
+        }
+        assert_eq!(
+            rig.actions
+                .iter()
+                .filter(|a| matches!(a, Action::Pause))
+                .count(),
+            1
+        );
+        frame(&mut dispatcher, &mut rig, Some((Key::Down, Edge::Down)));
+        frame(&mut dispatcher, &mut rig, Some((Key::Down, Edge::Up)));
+        assert!(dispatcher.focus().unwrap().elem >= 0x1000_0000);
+        frame(&mut dispatcher, &mut rig, Some((Key::Ok, Edge::Down)));
+        frame(&mut dispatcher, &mut rig, Some((Key::Ok, Edge::Up)));
+        for _ in 0..20 {
+            frame(&mut dispatcher, &mut rig, None);
+        }
+        assert_eq!(
+            rig.actions
+                .iter()
+                .filter(|a| matches!(a, Action::SeekTo(p) if *p == 42.))
+                .count(),
+            1
+        );
+        assert!(
+            rig.playback.playing,
+            "marker selection must preserve transport intent"
+        );
+        frame(&mut dispatcher, &mut rig, Some((Key::Up, Edge::Down)));
+        frame(&mut dispatcher, &mut rig, Some((Key::Up, Edge::Up)));
+        assert_eq!(dispatcher.focus().unwrap().elem, 3);
+        frame(&mut dispatcher, &mut rig, Some((Key::Up, Edge::Down)));
+        frame(&mut dispatcher, &mut rig, Some((Key::Up, Edge::Up)));
+        for _ in 0..20 {
+            frame(&mut dispatcher, &mut rig, None);
+        }
+        let mut probe = String::new();
+        dispatcher.top_screen().unwrap().state().probe(&mut probe);
+        assert!(
+            probe.contains("dismissed=true"),
+            "hidden HUD reopened: {probe}"
+        );
+        frame(&mut dispatcher, &mut rig, Some((Key::Down, Edge::Down)));
+        frame(&mut dispatcher, &mut rig, Some((Key::Down, Edge::Up)));
+        assert_eq!(dispatcher.focus().unwrap().elem, 0);
+        probe.clear();
+        dispatcher.top_screen().unwrap().state().probe(&mut probe);
+        assert!(probe.contains("dismissed=false"));
+    }
+    #[test]
     fn wheel_restores_hover_after_dpad_without_pointer_travel() {
         let _lock = crate::testlock::serial();
         let mut rig = TestRig {
@@ -1031,6 +1147,7 @@ mod tests {
             textures: HashMap::new(),
             work: Vec::new(),
             playback: PlaybackView::default(),
+            actions: Vec::new(),
         };
         let mut dispatcher = Dispatcher::<StashHost>::new();
         dispatcher.request(MachineId::Nav, NavOp::Root(StashArg::Scenes));

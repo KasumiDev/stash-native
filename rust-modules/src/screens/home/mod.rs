@@ -76,10 +76,9 @@ pub(crate) const STRIP_ACCOUNT_ELEM: u32 = crate::ui::dispatch::STRIP_BASE + 4;
 
 const MAX_HUBS: usize = crate::pms::MAX_SHELVES;
 const MAX_ITEMS: usize = crate::pms::MAX_SHELF_ITEMS;
-const HERO_FLIP_CD: f32 = 0.35;
+const HERO_FLIP_CD: f32 = crate::ui::hero_transition::FLIP_COOLDOWN;
 const HERO_AUTO_S: f32 = 8.0;
-const K_SLIDE: f32 = 130.0;
-const HERO_SLIDE_REST_PX: f32 = 0.5;
+
 /// How near its target the snap dive has to be, in snap units (0 = hero, 1 = grid), before this
 /// page calls the dive over — **together with [`SNAP_REST_VEL`], never alone.** `K_SNAP` is
 /// critically damped, so the dive spends its last dozen frames inside any position threshold worth
@@ -624,7 +623,7 @@ impl HomeScreen {
         self.outgoing = Some(current);
         self.carousel = Some(incoming);
         self.hero_dir = dir as f32;
-        self.hero_slide.jump(0.0);
+        crate::ui::hero_transition::begin(&mut self.hero_slide);
         self.hero_flip_cd = HERO_FLIP_CD;
         self.hero_auto = HERO_AUTO_S;
         true
@@ -632,10 +631,7 @@ impl HomeScreen {
 
     fn slide_offsets(&self) -> Option<(f32, f32)> {
         self.outgoing.as_ref()?;
-        Some((
-            -self.hero_dir * self.hero_slide.pos * SCR_W,
-            self.hero_dir * (1.0 - self.hero_slide.pos) * SCR_W,
-        ))
+        Some(crate::ui::hero_transition::offsets(&self.hero_slide, self.hero_dir))
     }
 
     fn locate(&self, elem: u32) -> Option<Located> {
@@ -813,9 +809,7 @@ impl HomeScreen {
             % (crate::ui::widgets::Spinner::PERIOD_MS as f32 * 1000.0);
         self.hero_flip_cd = (self.hero_flip_cd - dt).max(0.0);
         if self.outgoing.is_some() {
-            self.hero_slide.step(1.0, K_SLIDE, dt);
-            if (1.0 - self.hero_slide.pos).abs() * SCR_W < HERO_SLIDE_REST_PX {
-                self.hero_slide.jump(1.0);
+            if crate::ui::hero_transition::step(&mut self.hero_slide, dt) {
                 self.outgoing = None;
             }
         }

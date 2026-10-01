@@ -34,7 +34,8 @@ pub struct Scene {
     pub scene_markers: Vec<SceneMarker>,
 }
 
-/// Marker artwork is still imagery; activating a marker seeks within the current session.
+/// Marker artwork is cached still imagery; preview video stays transient.
+/// Activating a marker seeks within the current session.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SceneMarker {
@@ -43,6 +44,8 @@ pub struct SceneMarker {
     pub seconds: f64,
     pub end_seconds: Option<f64>,
     pub screenshot: Option<String>,
+    /// Resolved by the client, not a requested GraphQL field.
+    pub preview: Option<String>,
 }
 
 /// The small projection used to count a performer's tags without downloading scene media.

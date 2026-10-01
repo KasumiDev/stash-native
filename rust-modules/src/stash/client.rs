@@ -326,11 +326,35 @@ impl Client {
         serde_json::from_value(node.clone()).map_err(|_| Error::InvalidResponse)
     }
     pub fn scene(&self, id: &str) -> Result<Scene, Error> {
-        self.detail(
+        let mut scene: Scene = self.detail(
             "findScene",
             &format!("{SCENE} scene_markers {{ id title seconds end_seconds screenshot }}"),
             id,
-        )
+        )?;
+        self.marker_media(&mut scene)?;
+        Ok(scene)
+    }
+    fn marker_media(&self, scene: &mut Scene) -> Result<(), Error> {
+        for marker in &mut scene.scene_markers {
+            if marker.id.is_empty() {
+                marker.screenshot = None;
+                marker.preview = None;
+                continue;
+            }
+            let mut segment = String::new();
+            for byte in marker.id.bytes() {
+                if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+                    segment.push(byte as char);
+                } else {
+                    use std::fmt::Write;
+                    let _ = write!(segment, "%{byte:02X}");
+                }
+            }
+            marker.screenshot =
+                Some(self.media_url(&format!("/scene_marker/{segment}/screenshot"))?);
+            marker.preview = Some(self.media_url(&format!("/scene_marker/{segment}/stream"))?);
+        }
+        Ok(())
     }
     pub fn performer(&self, id: &str) -> Result<Performer, Error> {
         self.detail(
@@ -670,6 +694,35 @@ mod tests {
                 expected
             );
         }
+    }
+    #[test]
+    fn marker_media_uses_canonical_endpoints_and_same_origin_auth() {
+        let client = Client::new(Config {
+            server_url: "https://example.test/graphql".into(),
+            api_key: "a& b".into(),
+        })
+        .unwrap();
+        let mut scene = Scene {
+            scene_markers: vec![
+                super::super::SceneMarker {
+                    id: "19/unsafe".into(),
+                    screenshot: Some("https://other.test/old".into()),
+                    ..Default::default()
+                },
+                super::super::SceneMarker::default(),
+            ],
+            ..Default::default()
+        };
+        client.marker_media(&mut scene).unwrap();
+        assert_eq!(
+            scene.scene_markers[0].screenshot.as_deref(),
+            Some("https://example.test/scene_marker/19%2Funsafe/screenshot?apikey=a%26%20b")
+        );
+        assert_eq!(
+            scene.scene_markers[0].preview.as_deref(),
+            Some("https://example.test/scene_marker/19%2Funsafe/stream?apikey=a%26%20b")
+        );
+        assert!(scene.scene_markers[1].preview.is_none());
     }
     #[test]
     fn media_auth_never_escapes_configured_origin() {

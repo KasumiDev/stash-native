@@ -38,15 +38,27 @@ impl Markers {
                     && a.seconds == b.seconds
                     && a.title == b.title
                     && a.screenshot == b.screenshot
+                    && a.preview == b.preview
             })
         {
             return;
         }
-        let old: HashMap<_, _> = self.items.iter().zip(&self.keys).map(|(m,k)| (m.id.clone(), *k)).collect();
-        let mut reserved: Vec<u32> = items.iter().filter_map(|m| old.get(&m.id).copied()).collect();
+        let old: HashMap<_, _> = self
+            .items
+            .iter()
+            .zip(&self.keys)
+            .map(|(m, k)| (m.id.clone(), *k))
+            .collect();
+        let mut reserved: Vec<u32> = items
+            .iter()
+            .filter_map(|m| old.get(&m.id).copied())
+            .collect();
         self.keys.clear();
         for item in &items {
-            if let Some(key) = old.get(&item.id) { self.keys.push(*key); continue; }
+            if let Some(key) = old.get(&item.id) {
+                self.keys.push(*key);
+                continue;
+            }
             let hash = item
                 .id
                 .bytes()
@@ -74,6 +86,15 @@ impl Markers {
             .iter()
             .position(|k| *k == key)
             .map(|i| self.items[i].seconds)
+    }
+    pub fn preview(&self, focus: Option<u32>) -> Option<(String, String)> {
+        let index = self.keys.iter().position(|key| Some(*key) == focus)?;
+        let marker = &self.items[index];
+        marker
+            .preview
+            .as_ref()
+            .filter(|url| !url.is_empty())
+            .map(|url| (format!("marker:{}", marker.id), url.clone()))
     }
     pub fn near(&self, position: f64) -> Option<u32> {
         let i = self
@@ -131,6 +152,7 @@ impl Markers {
         textures: &HashMap<String, (u32, f32, f32)>,
         focus: Option<u32>,
         offset: f32,
+        preview: Option<(u32, f32, f32)>,
         measure: &dyn Measure,
     ) {
         let Some(row) = self.motion.as_ref() else {
@@ -155,7 +177,10 @@ impl Markers {
             1920.,
             |i| Art::Texture {
                 key: &identities[i],
-                image: textures.get(&identities[i]).copied(),
+                image: (focus == Some(self.keys[i]))
+                    .then_some(preview)
+                    .flatten()
+                    .or_else(|| textures.get(&identities[i]).copied()),
                 portrait: false,
             },
             |_| None,
@@ -184,6 +209,20 @@ mod tests {
             title: id.into(),
             ..Default::default()
         }
+    }
+    #[test]
+    fn preview_belongs_only_to_focused_marker_and_refreshes_url() {
+        let mut row = Markers::default();
+        let mut a = marker("a", 0.);
+        a.preview = Some("https://example.test/scene_marker/a/stream".into());
+        row.sync(&[a.clone(), marker("b", 10.)]);
+        assert!(row.preview(None).is_none());
+        assert!(row.preview(Some(row.keys[1])).is_none());
+        let key = row.keys[0];
+        assert_eq!(row.preview(Some(key)).unwrap().0, "marker:a");
+        a.preview = Some("https://example.test/scene_marker/a/stream?t=2".into());
+        row.sync(&[a]);
+        assert!(row.preview(Some(key)).unwrap().1.ends_with("t=2"));
     }
     #[test]
     fn markers_sort_and_keep_identity_when_earlier_marker_arrives() {

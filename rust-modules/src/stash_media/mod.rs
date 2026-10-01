@@ -158,6 +158,14 @@ impl MediaManager {
         self.preview = None;
         self.focus = None;
     }
+    /// A looping preview only finishes on failure/cancellation. Drop its transient
+    /// texture while retaining the failed job until focus changes, avoiding retry loops.
+    pub fn failed_preview(&self) -> Option<&str> {
+        self.preview
+            .as_ref()
+            .filter(|job| job.finished.load(Ordering::Acquire))
+            .and_then(|_| self.focus.as_ref().map(|(key, _, _)| key.as_str()))
+    }
     pub fn poll(&mut self, now_ms: u64) -> Vec<MediaFrame> {
         if self.preview_ready(now_ms) {
             if let Some((key, url, _)) = &self.focus {
@@ -189,8 +197,11 @@ impl MediaManager {
                     false,
                     self.budget.clone(),
                     self.active.clone(),
-                    crate::imgcache::classify_stash(&self.cache_namespace, url,
-                        still_transform(key)),
+                    crate::imgcache::classify_stash(
+                        &self.cache_namespace,
+                        url,
+                        still_transform(key),
+                    ),
                 ) {
                     self.jobs.insert(key.clone(), job);
                 }
@@ -260,8 +271,16 @@ fn spawn(
             if preview {
                 decode_preview(&key, &url, &s, &tx, &budget);
             } else {
-                still_cache::decode_image(&key, &url, animated, &s, &tx, &budget, &r,
-                    cache_key.as_ref().map(|key| (cache_generation, key)));
+                still_cache::decode_image(
+                    &key,
+                    &url,
+                    animated,
+                    &s,
+                    &tx,
+                    &budget,
+                    &r,
+                    cache_key.as_ref().map(|key| (cache_generation, key)),
+                );
             }
             f.store(true, Ordering::Release);
             a.fetch_sub(1, Ordering::AcqRel);
@@ -629,12 +648,20 @@ fn append_asset_chunk(bytes: &mut Vec<u8>, chunk: &[u8], reserved: usize) -> boo
     true
 }
 fn still_transform(key: &str) -> &'static str {
-    if key.starts_with("blur:scene:") { "scene-blur-320x180-v1" }
-    else if key.starts_with("blur:") { "blur-1280x720-v1" }
-    else { "contain-1280x720-v1" }
+    if key.starts_with("blur:scene:") {
+        "scene-blur-320x180-v1"
+    } else if key.starts_with("blur:") {
+        "blur-1280x720-v1"
+    } else {
+        "contain-1280x720-v1"
+    }
 }
 fn still_bounds(key: &str) -> (u32, u32) {
-    if key.starts_with("blur:scene:") { (320, 180) } else { (1280, 720) }
+    if key.starts_with("blur:scene:") {
+        (320, 180)
+    } else {
+        (1280, 720)
+    }
 }
 fn static_frame(
     key: &str,
@@ -655,21 +682,28 @@ fn static_frame(
     let decoder = reader.into_decoder().ok()?;
     let (width, height) = decoder.dimensions();
     let (limit_width, limit_height) = still_bounds(key);
-    let thumb_pixels = (width.min(limit_width) as usize).checked_mul(height.min(limit_height) as usize)?;
+    let thumb_pixels =
+        (width.min(limit_width) as usize).checked_mul(height.min(limit_height) as usize)?;
     // Reserve decoded pixels, codec working storage and thumbnail/conversion/output buffers
     // before read_image can allocate. Small images pay their actual dimensions, not 16 MiB.
     let working = usize::try_from(decoder.total_bytes())
         .ok()?
         .checked_mul(2)?
-        .checked_add(
-            thumb_pixels.checked_mul(decoder.color_type().bytes_per_pixel() as usize + if key.starts_with("blur:") { 24 } else { 8 })?,
-        )?;
+        .checked_add(thumb_pixels.checked_mul(
+            decoder.color_type().bytes_per_pixel() as usize
+                + if key.starts_with("blur:") { 24 } else { 8 },
+        )?)?;
     let mut allocation = reserve_or_retry(budget, working, blocked)?;
     let image = image::DynamicImage::from_decoder(decoder).ok()?;
     let thumb = image.thumbnail(width.min(limit_width), height.min(limit_height));
     drop(image);
-    let thumb = if key.starts_with("blur:scene:") { thumb.blur(12.) }
-        else if key.starts_with("blur:") { thumb.blur(24.) } else { thumb };
+    let thumb = if key.starts_with("blur:scene:") {
+        thumb.blur(12.)
+    } else if key.starts_with("blur:") {
+        thumb.blur(24.)
+    } else {
+        thumb
+    };
     let rgba = thumb.into_rgba8();
     let (output_width, output_height) = rgba.dimensions();
     let pixels = rgba.into_raw();
@@ -736,6 +770,12 @@ unsafe extern "C" fn seek_source(source: *mut c_void, offset: i64, whence: i32) 
         -1
     }
 }
+/// Absolute PTS pacing avoids adding decode time to each frame's interval.
+fn preview_wait(pts_ms: u64, elapsed: Duration) -> Option<Duration> {
+    let deadline = Duration::from_millis(pts_ms);
+    (elapsed <= deadline.saturating_add(Duration::from_millis(100)))
+        .then(|| deadline.saturating_sub(elapsed))
+}
 #[cfg(not(test))]
 fn decode_preview(
     key: &str,
@@ -795,16 +835,15 @@ fn decode_preview(
         if n == 2 {
             continue;
         }
+        if first_pts.is_none() {
+            // Opening/filling the decoder must not make the first frame late.
+            clock = Instant::now();
+        }
         pts = pts.saturating_sub(*first_pts.get_or_insert(pts)).max(0);
-        if clock.elapsed().as_millis() > pts as u128 + 100 {
+        let Some(delay) = preview_wait(pts as u64, clock.elapsed()) else {
             continue;
-        }
-        if pts > 0 {
-            wait(
-                stop,
-                Duration::from_millis(pts as u64).saturating_sub(clock.elapsed()),
-            );
-        }
+        };
+        wait(stop, delay);
         if w <= 0 || h <= 0 || w > 640 || h > 360 {
             break;
         }
@@ -837,6 +876,70 @@ fn decode_preview(
 mod tests {
     use super::*;
     #[test]
+    fn failed_preview_reverts_to_still_and_waits_for_new_focus() {
+        let mut manager = MediaManager::new();
+        manager.focus_preview(Some("preview:marker:a"), Some("https://example.test/a"), 0);
+        let (_tx, rx) = mpsc::sync_channel(1);
+        manager.preview = Some(Job {
+            stop: Arc::new(AtomicBool::new(false)),
+            rx,
+            finished: Arc::new(AtomicBool::new(true)),
+            retry: Arc::new(AtomicBool::new(false)),
+        });
+        assert_eq!(manager.failed_preview(), Some("preview:marker:a"));
+        assert!(!manager.preview_ready(1000));
+        manager.focus_preview(
+            Some("preview:marker:b"),
+            Some("https://example.test/b"),
+            1000,
+        );
+        assert!(manager.failed_preview().is_none());
+        assert!(!manager.preview_ready(1699));
+        assert!(manager.preview_ready(1700));
+    }
+    #[test]
+    fn preview_pts_pacing_preserves_thirty_fps_and_drops_late_frames() {
+        assert_eq!(
+            preview_wait(33, Duration::from_millis(7)),
+            Some(Duration::from_millis(26))
+        );
+        assert_eq!(
+            preview_wait(67, Duration::from_millis(36)),
+            Some(Duration::from_millis(31))
+        );
+        assert_eq!(
+            preview_wait(67, Duration::from_millis(80)),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(preview_wait(67, Duration::from_millis(168)), None);
+    }
+    #[test]
+    fn marker_screenshots_use_account_partitioned_static_cache_identity() {
+        let url = "https://example.test/scene_marker/19/screenshot?apikey=a";
+        let transform = still_transform("marker:19");
+        let key = crate::imgcache::classify_stash("account-a", url, transform).unwrap();
+        assert_eq!(
+            Some(key.clone()),
+            crate::imgcache::classify_stash(
+                "account-a",
+                "https://example.test/scene_marker/19/screenshot?apikey=b",
+                transform
+            )
+        );
+        assert_ne!(
+            Some(key.clone()),
+            crate::imgcache::classify_stash("account-b", url, transform)
+        );
+        assert_ne!(
+            Some(key),
+            crate::imgcache::classify_stash(
+                "account-a",
+                "https://example.test/scene_marker/19/stream",
+                transform
+            )
+        );
+    }
+    #[test]
     fn budget_is_shared_and_reclaimed() {
         let budget = Arc::new(AtomicUsize::new(0));
         let a = Allocation::reserve(&budget, BUDGET).unwrap();
@@ -863,12 +966,21 @@ mod tests {
             image::Rgba([white, white, white, 255])
         });
         let mut bytes = Vec::new();
-        image::ImageEncoder::write_image(image::codecs::png::PngEncoder::new(&mut bytes),
-            source.as_raw(), source.width(), source.height(), image::ExtendedColorType::Rgba8).unwrap();
+        image::ImageEncoder::write_image(
+            image::codecs::png::PngEncoder::new(&mut bytes),
+            source.as_raw(),
+            source.width(),
+            source.height(),
+            image::ExtendedColorType::Rgba8,
+        )
+        .unwrap();
         let budget = Arc::new(AtomicUsize::new(0));
         let frame = static_frame("blur:scene:1", &bytes, &budget, &AtomicBool::new(false)).unwrap();
         assert_eq!((frame.width, frame.height), (320, 180));
-        assert!(frame.rgba.chunks_exact(4).any(|pixel| pixel[0] > 0 && pixel[0] < 255));
+        assert!(frame
+            .rgba
+            .chunks_exact(4)
+            .any(|pixel| pixel[0] > 0 && pixel[0] < 255));
         assert_eq!(budget.load(Ordering::Acquire), frame.rgba.capacity());
         assert_ne!(still_transform("blur:scene:1"), still_transform("scene:1"));
         drop(frame);
@@ -1347,16 +1459,16 @@ mod tests {
             return;
         }
         let dir = CString::new(directory.to_string_lossy().as_bytes()).unwrap();
-        for (bytes, expected, minimum_skips) in [
+        for (bytes, expected, smooth_thirty) in [
             (
                 include_bytes!("fixtures/preview.mp4").as_slice(),
                 (320, 180),
-                0,
+                false,
             ),
             (
                 include_bytes!("fixtures/portrait-preview.mp4").as_slice(),
                 (202, 360),
-                20,
+                true,
             ),
         ] {
             let mut source = Memory { bytes, at: 0 };
@@ -1382,12 +1494,11 @@ mod tests {
                 assert!(result >= 0);
                 if result == 0 {
                     loops += 1;
-                    // A 29.97 fps clip should present approximately every other frame,
-                    // never become the old 67-ms 2/3-frame alternation.
-                    if minimum_skips > 0 {
+                    // Decode the original 29.97 fps clip directly at its native cadence.
+                    if smooth_thirty {
                         assert!(presented_pts
                             .windows(2)
-                            .all(|p| (60..=75).contains(&(p[1] - p[0]))));
+                            .all(|p| (30..=37).contains(&(p[1] - p[0]))));
                     }
                     presented_pts.clear();
                 } else if result == 2 {
@@ -1403,7 +1514,9 @@ mod tests {
             }
             unsafe { stash_preview_close(decoder) };
             assert!(loops >= 2 && frames >= 12);
-            assert!(skips >= minimum_skips);
+            if smooth_thirty {
+                assert_eq!(skips, 0);
+            }
         }
     }
 }
