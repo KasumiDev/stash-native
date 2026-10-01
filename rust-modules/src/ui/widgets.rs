@@ -991,6 +991,46 @@ pub(crate) fn watched_mark(p: Painter, card: Rect, rad: f32) {
     crate::ui::icons::draw(p, crate::ui::icons::Icon::Check, tick, theme::TILE_MARK_INK);
 }
 
+/// An explicit counter in the artwork's upper-right corner, riding the card's focus scale.
+pub(crate) fn o_count_mark(
+    p: Painter,
+    card: Rect,
+    count: i64,
+    measure: &dyn crate::ui::machine::Measure,
+) {
+    let icon_size = ((card.w * TICK_RATIO).clamp(20., 32.) / 4.).round() * 4.;
+    let inset = card.w * TICK_INSET;
+    let padding = theme::space::XS;
+    let budget = (card.w - inset * 2. - icon_size - padding * 3.).max(0.);
+    let count = measure.fit_line(&count.max(0).to_string(), budget, theme::size::MICRO, true);
+    let width = measure.width(&count, theme::size::MICRO, true);
+    let badge = Rect::new(
+        card.x + card.w - inset - icon_size - width - padding * 3.,
+        card.y + inset,
+        icon_size + width + padding * 3.,
+        icon_size + padding * 2.,
+    );
+    p.rect(
+        badge,
+        badge.h * 0.5,
+        theme::PILL_KEYLINE_BG,
+        theme::PILL_KEYLINE_BG,
+        0.,
+    );
+    crate::ui::icons::draw(
+        p,
+        crate::ui::icons::Icon::Droplets,
+        Rect::new(badge.x + padding, badge.y + padding, icon_size, icon_size),
+        theme::TILE_MARK_INK,
+    );
+    Label::new(count.as_ptr(), theme::size::MICRO, theme::TILE_MARK_INK)
+        .bold()
+        .draw(
+            p,
+            Rect::new(badge.x + icon_size + padding * 2., badge.y, width, badge.h),
+        );
+}
+
 /// Person-glyph box as a fraction of a headshot tile — the [`Art::Person`] fallback's one ratio.
 /// Deliberately TIGHTER than [`DISC_ICON_RATIO`] (0.54, the ratio every disc *control* glyph uses,
 /// and what the profile chip's own fallback works out to): a headshot tile is 190px, and 0.54 of it

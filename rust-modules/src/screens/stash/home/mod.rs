@@ -486,6 +486,7 @@ mod tests {
                     tiles: vec![Tile {
                         identity: "scene:1".into(),
                         title: "Scene 1".into(),
+                        o_count: None,
                         caption: String::new(),
                         image: None,
                         preview: None,
@@ -499,7 +500,8 @@ mod tests {
                     tiles: vec![Tile {
                         identity: "performer:1".into(),
                         title: "Favorite performer".into(),
-                        caption: "★ · O 10".into(),
+                        o_count: Some(10),
+                        caption: "★".into(),
                         image: None,
                         preview: None,
                         action: Action::Open(StashArg::Performer("1".into())),

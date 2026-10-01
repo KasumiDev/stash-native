@@ -868,6 +868,7 @@ mod tests {
                     .map(|i| crate::stores::stash::Tile {
                         identity: format!("scene:fixture{i}"),
                         title: format!("Fixture scene {i}"),
+                        o_count: None,
                         caption: String::new(),
                         image: None,
                         preview: None,

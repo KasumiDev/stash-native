@@ -40,6 +40,8 @@ pub enum Icon {
     Cc,
     Audio,
     Check,
+    /// Three outlined droplets: Stash's explicit O-count, never a watched-state mark.
+    Droplets,
     Chevron, // points RIGHT; the directional variants below are separate masks (the
     // rasterizer draws untransformed, so direction is per-asset, not a rotation)
     ChevronDown,
@@ -272,6 +274,7 @@ fn src(id: Icon) -> &'static str {
         Icon::Cc => include_str!("../../../assets/icons/cc.svg"),
         Icon::Audio => include_str!("../../../assets/icons/audio.svg"),
         Icon::Check => include_str!("../../../assets/icons/check.svg"),
+        Icon::Droplets => include_str!("../../../assets/icons/droplets.svg"),
         Icon::Chevron => include_str!("../../../assets/icons/chevron.svg"),
         Icon::ChevronLeft => include_str!("../../../assets/icons/chevron-left.svg"),
         Icon::ChevronDown => include_str!("../../../assets/icons/chevron-down.svg"),
@@ -535,6 +538,22 @@ mod ink_tests {
                 assert_eq!(alpha(0, y), 0, "{id:?} has ink on the left border");
                 assert_eq!(alpha(px - 1, y), 0, "{id:?} has ink on the right border");
             }
+        }
+    }
+
+    #[test]
+    fn droplets_are_outline_masks_at_card_size_and_four_times_size() {
+        for size in [20, 80] {
+            let rgba = crate::svg::rasterize(src(Icon::Droplets), size, size).unwrap();
+            let alpha = |x: i32, y: i32| rgba[((y * size + x) * 4 + 3) as usize];
+            assert_eq!(rgba.chunks_exact(4).map(|pixel| pixel[3]).max(), Some(255));
+            for edge in 0..size {
+                assert_eq!(alpha(edge, 0), 0);
+                assert_eq!(alpha(edge, size - 1), 0);
+                assert_eq!(alpha(0, edge), 0);
+                assert_eq!(alpha(size - 1, edge), 0);
+            }
+            assert_eq!(alpha(size * 9 / 24, size * 11 / 24), 0, "the large droplet stays hollow");
         }
     }
 

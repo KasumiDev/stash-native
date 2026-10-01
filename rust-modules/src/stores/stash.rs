@@ -72,6 +72,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 pub struct Tile {
     pub identity: String,
     pub title: String,
+    pub o_count: Option<i64>,
     pub caption: String,
     pub image: Option<String>,
     pub preview: Option<String>,
@@ -419,6 +420,7 @@ fn fixture(route: &StashArg, query: &Query) -> PageData {
                     Tile {
                         identity: "play".into(),
                         title: "Play from beginning".into(),
+                        o_count: None,
                         caption: String::new(),
                         image: scene.paths.screenshot.clone(),
                         preview: None,
@@ -427,6 +429,7 @@ fn fixture(route: &StashArg, query: &Query) -> PageData {
                     Tile {
                         identity: "resume".into(),
                         title: "Resume".into(),
+                        o_count: None,
                         caption: String::new(),
                         image: scene.paths.screenshot.clone(),
                         preview: None,
@@ -454,6 +457,7 @@ fn fixture(route: &StashArg, query: &Query) -> PageData {
                     .map(|(index, image)| Tile {
                         identity: format!("image:{}", image.id),
                         title: image.title.unwrap_or_default(),
+                        o_count: None,
                         caption: String::new(),
                         image: image.paths.image,
                         preview: None,
@@ -520,11 +524,8 @@ fn scene(s: Scene) -> Tile {
             .clone()
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| format!("Scene {}", s.id)),
-        caption: format!(
-            "{} · O {}",
-            s.date.as_deref().unwrap_or("Undated"),
-            s.o_counter
-        ),
+        o_count: Some(s.o_counter),
+        caption: s.date.unwrap_or_else(|| "Undated".into()),
         image: s.paths.screenshot.clone(),
         preview: s.paths.preview.clone(),
         action: Action::Open(StashArg::Scene(s.id)),
@@ -534,7 +535,8 @@ fn performer(p: Performer) -> Tile {
     Tile {
         identity: format!("performer:{}", p.id),
         title: p.name,
-        caption: format!("{}O {}", if p.favorite { "★ · " } else { "" }, p.o_counter),
+        o_count: Some(p.o_counter),
+        caption: if p.favorite { "★".into() } else { String::new() },
         image: p.image_path,
         preview: None,
         action: Action::Open(StashArg::Performer(p.id)),
@@ -544,6 +546,7 @@ fn gallery(g: Gallery) -> Tile {
     Tile {
         identity: format!("gallery:{}", g.id),
         title: g.title.unwrap_or_else(|| format!("Gallery {}", g.id)),
+        o_count: None,
         caption: format!("{} images", g.image_count),
         image: g.cover.and_then(|i| i.paths.thumbnail.or(i.paths.image)),
         preview: None,
@@ -554,6 +557,7 @@ fn tag(t: Tag) -> Tile {
     Tile {
         identity: format!("tag:{}", t.id),
         title: t.name,
+        o_count: None,
         caption: if t.favorite {
             "★".into()
         } else {
@@ -677,6 +681,7 @@ fn load(c: &Client, r: &StashArg, q: &Query) -> Result<PageData, String> {
                     Tile {
                         identity: "play".into(),
                         title: "Play from beginning".into(),
+                        o_count: None,
                         caption: String::new(),
                         image: s.paths.screenshot.clone(),
                         preview: None,
@@ -689,6 +694,7 @@ fn load(c: &Client, r: &StashArg, q: &Query) -> Result<PageData, String> {
                             (s.resume_time / 60.).floor(),
                             s.resume_time % 60.
                         ),
+                        o_count: None,
                         caption: String::new(),
                         image: s.paths.screenshot.clone(),
                         preview: None,
@@ -764,6 +770,7 @@ fn load(c: &Client, r: &StashArg, q: &Query) -> Result<PageData, String> {
                 .map(|(index, i)| Tile {
                     identity: format!("image:{}", i.id),
                     title: i.title.unwrap_or_else(|| format!("Image {}", index + 1)),
+                    o_count: None,
                     caption: String::new(),
                     image: i.paths.thumbnail.or(i.paths.image),
                     preview: None,

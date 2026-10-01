@@ -405,6 +405,7 @@ impl StashScreen {
         Tile {
             identity: format!("control:{id}"),
             title,
+            o_count: None,
             caption: String::new(),
             image: None,
             preview: None,
@@ -1302,7 +1303,13 @@ impl Screen<StashHost> for StashScreen {
                     },
                     |_| None,
                     |i| TileLabel::titled(&row.tiles[i].title, &row.tiles[i].caption),
-                    |_, _, _, _| {},
+                    |p, i, x, focused| {
+                        if let Some(count) = row.tiles[i].o_count {
+                            let scale = row.motion.scale(i) * if focused { crate::ui::press::scale() } else { 1. };
+                            crate::ui::widgets::o_count_mark(p,
+                                Rect::new(x, y, row.style.w, row.style.h).scaled(scale), count, f.cx.measure);
+                        }
+                    },
                     f.cx.measure,
                 );
             }
@@ -1376,6 +1383,9 @@ impl Screen<StashHost> for StashScreen {
                             &row.style,
                             None,
                         );
+                    }
+                    if let Some(count) = tile.o_count {
+                        crate::ui::widgets::o_count_mark(p, rect, count, f.cx.measure);
                     }
                     if matches!(self.route, StashArg::Tags) && image.is_none() {
                         let name = crate::text::elide_by(
@@ -1476,6 +1486,7 @@ mod tests {
         Tile {
             identity: format!("scene:{id}"),
             title: id.into(),
+            o_count: None,
             caption: String::new(),
             image: None,
             preview: None,
