@@ -20,6 +20,9 @@ use std::os::raw::{c_char, c_int, c_uchar, c_uint, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Once;
 
+#[path = "ff_progressive_window.rs"]
+mod progressive_window;
+
 /// Feed audio (es=2) to the pipeline. Cleared by the /tmp/plxnative-noaudio dev trigger to
 /// A/B whether the audio ES (E-AC3/Atmos) is what stalls the sink on 4K HEVC.
 static FEED_AUDIO: AtomicBool = AtomicBool::new(true);
@@ -1635,7 +1638,7 @@ const AVSEEK_SIZE: c_int = 0x10000;
 /// Never guessed per call.
 ///
 /// * [`Src::Socket`] is the original and the default: `stream.rs`'s raw TCP socket wrapping the
-///   ENGINE-owned `HttpStream` — cleartext, numeric address, seeking by closing and re-opening
+///   ENGINE-owned `HttpStream` — cleartext, numeric address, distant seeking by closing and re-opening
 ///   with a byte `Range`. Its behaviour here is byte for byte what it was before this enum
 ///   existed.
 /// * [`Src::Curl`] is the https path ([`crate::curlio`]), which the demux thread owns outright.
@@ -2258,6 +2261,9 @@ struct AvioState {
     /// a segment body is already complete before feed.
     bounce: Vec<u8>,
     bounce_pos: usize,
+    /// Progressive compressed bytes only; HLS retains its acquisition accounting.
+    /// Allocated lazily and capped at 4 MiB, independently of decoded preview frames.
+    read_window: Option<progressive_window::ReadWindow>,
 }
 
 // TEST ONLY: a deterministic stand-in for the two `Instant::elapsed()` calls that measure
@@ -2535,8 +2541,11 @@ fn avio_stopped(s: &mut AvioState) -> c_int {
 }
 
 extern "C" fn read_cb(op: *mut c_void, dst: *mut u8, n: c_int) -> c_int {
+    unsafe { read_state(&mut *(op as *mut AvioState), dst, n) }
+}
+
+unsafe fn read_state(s: &mut AvioState, dst: *mut u8, n: c_int) -> c_int {
     unsafe {
-        let s = &mut *(op as *mut AvioState);
         loop {
             // interrupt: bail out of a blocked read on teardown (aborted) only. A seek does NOT
             // interrupt the read — the demux thread services it itself between two av_read_frame
@@ -2546,8 +2555,23 @@ extern "C" fn read_cb(op: *mut c_void, dst: *mut u8, n: c_int) -> c_int {
                 s.clear_bounce();
                 return AVERROR_EOF;
             }
+            if dst.is_null() || n <= 0 {
+                return 0;
+            }
+            if !s.io_failed {
+                if let Some(window) = &s.read_window {
+                    let cached = window.read(s.off, std::slice::from_raw_parts_mut(dst, n as usize));
+                    if cached > 0 {
+                        s.off += cached as i64;
+                        return cached as c_int;
+                    }
+                }
+            }
             let bounced = s.take_bounce(std::slice::from_raw_parts_mut(dst, n.max(0) as usize));
             if bounced > 0 {
+                if let Some(window) = &mut s.read_window {
+                    window.append(s.off, std::slice::from_raw_parts(dst, bounced));
+                }
                 s.off += bounced as i64;
                 s.body_bytes = s.body_bytes.saturating_add(bounced as u64);
                 return bounced as c_int;
@@ -2684,6 +2708,9 @@ extern "C" fn read_cb(op: *mut c_void, dst: *mut u8, n: c_int) -> c_int {
                 s.first_byte_at = Some(std::time::Instant::now());
             }
             s.body_bytes = s.body_bytes.saturating_add(r as u64);
+            if let Some(window) = &mut s.read_window {
+                window.append(s.off, std::slice::from_raw_parts(dst, r as usize));
+            }
             s.off += r as i64;
             SHARED.dg_net_rx.fetch_add(r as i64, Ordering::Relaxed);
             return r;
@@ -2715,7 +2742,6 @@ extern "C" fn seek_cb(op: *mut c_void, offset: i64, whence: c_int) -> i64 {
             s.clear_bounce();
             return -1;
         }
-        s.clear_bounce();
         let target = match whence {
             SEEK_SET => offset,
             SEEK_CUR => s.off + offset,
@@ -2725,6 +2751,29 @@ extern "C" fn seek_cb(op: *mut c_void, offset: i64, whence: c_int) -> i64 {
         if target < 0 {
             return -1;
         }
+        if !s.io_failed {
+            if let Some(window) = &s.read_window {
+                if window.contains(target) {
+                    s.off = target;
+                    return target;
+                }
+                // A nearby forward jump consumes this response instead of opening a
+                // new Range. Keep those skipped bytes for the matching audio chunk.
+                if target > window.end()
+                    && target - window.end() <= progressive_window::CAPACITY as i64
+                {
+                    let mut skip = [0u8; 65536];
+                    while s.off < target {
+                        let count = (target - s.off).min(skip.len() as i64) as c_int;
+                        if read_state(s, skip.as_mut_ptr(), count) <= 0 {
+                            return -1;
+                        }
+                    }
+                    return target;
+                }
+            }
+        }
+        s.clear_bounce();
         let aq = s.aq;
         let mut hopped_to_tls = None;
         let ok = match &mut s.src {
@@ -2792,6 +2841,9 @@ extern "C" fn seek_cb(op: *mut c_void, offset: i64, whence: c_int) -> i64 {
             return -1;
         }
         s.off = target;
+        if let Some(window) = &mut s.read_window {
+            window.reset(target);
+        }
         // This may be libavformat healing a failed read. A source validated at the requested byte
         // has recovered; a later callback failure will arm the bit again.
         s.io_failed = false;
@@ -3976,6 +4028,7 @@ unsafe fn hls_input(
             acquisition: Some(acquisition),
             bounce: Vec::new(),
             bounce_pos: 0,
+            read_window: None,
         }),
         avio: std::ptr::null_mut(),
         fmt: std::ptr::null_mut(),
@@ -7896,6 +7949,7 @@ pub(crate) fn demux(
                     acquisition: None,
                     bounce: Vec::new(),
                     bounce_pos: 0,
+                    read_window: Some(progressive_window::ReadWindow::default()),
                 });
                 let buf = av_malloc(65536) as *mut u8;
                 if buf.is_null() {

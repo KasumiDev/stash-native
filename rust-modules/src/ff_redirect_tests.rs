@@ -134,9 +134,7 @@ fn hls_open_plain(
         &mut crate::checkpoint::NoCheckpoint,
     );
     let outcome = match opened {
-        Ok((Src::Socket { path, .. }, size, _)) => {
-            Ok((path.to_string_lossy().into_owned(), size))
-        }
+        Ok((Src::Socket { path, .. }, size, _)) => Ok((path.to_string_lossy().into_owned(), size)),
         Ok((Src::Curl(_), size, _)) => Ok(("<curl>".into(), size)),
         Ok((Src::Idle, _, _)) => Err("idle".into()),
         Err(e) => Err(format!("{e:?}")),
@@ -191,6 +189,84 @@ fn an_hls_open_follows_an_absolute_same_origin_302_and_keeps_the_token() {
 }
 
 #[test]
+fn progressive_interleaved_packets_do_not_reopen_http_connections() {
+    let _serial = crate::testlock::serial();
+    const SIZE: usize = 8 * 1024 * 1024;
+    let pms = Scripted::start(|head, _| {
+        let offset = head
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Range: bytes=")?
+                    .split('-')
+                    .next()?
+                    .parse::<usize>()
+                    .ok()
+            })
+            .unwrap_or(0);
+        let mut reply = format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {offset}-{}/{SIZE}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", SIZE - 1, SIZE - offset).into_bytes();
+        reply.extend((offset..SIZE).map(|i| (i % 251) as u8));
+        reply
+    });
+    let mut hs = crate::stream::http_stream_boxed();
+    let mut aq = crate::aq::aq_new(1 << 20);
+    let origin = crate::plex::Origin::http("127.0.0.1", pms.port as i32);
+    let (src, size) = open_plain_progressive(&mut *hs, &origin, "/interleaved.mp4", &mut *aq)
+        .unwrap_or_else(|_| panic!("fixture open"));
+    let mut state = AvioState {
+        src,
+        size,
+        aq: &mut *aq,
+        off: 0,
+        io_failed: false,
+        body_active_us: 0,
+        body_bytes: 0,
+        first_byte_at: None,
+        reserve_deadline: ReserveDeadlineState::new(None, false),
+        transport_watchdog: None,
+        acquisition: None,
+        bounce: Vec::new(),
+        bounce_pos: 0,
+        read_window: Some(progressive_window::ReadWindow::default()),
+    };
+    let op = &mut state as *mut AvioState as *mut c_void;
+    let mut buf = [0u8; 65536];
+    // Video is ahead of the matching audio chunk. Revisit the audio, then return
+    // to video without throwing away the existing connection or fetched bytes.
+    for target in [2 * 1024 * 1024, 65536, 2 * 1024 * 1024 + 65536, 131072] {
+        assert_eq!(seek_cb(op, target, SEEK_SET), target);
+        let n = read_cb(op, buf.as_mut_ptr(), buf.len() as c_int);
+        assert!(n > 0);
+        for (i, byte) in buf[..n as usize].iter().enumerate() {
+            assert_eq!(*byte, ((target as usize + i) % 251) as u8);
+        }
+    }
+    assert_eq!(
+        pms.requests().len(),
+        1,
+        "interleaved packets must reuse the progressive connection"
+    );
+    // A real long-distance seek still opens a validated Range, resets the old
+    // window, and returns bytes from the new position rather than old media.
+    let target = 7 * 1024 * 1024;
+    assert_eq!(seek_cb(op, target, SEEK_SET), target);
+    assert!(read_cb(op, buf.as_mut_ptr(), 64) > 0);
+    assert_eq!(buf[0], (target % 251) as u8);
+    assert_eq!(pms.requests().len(), 2);
+    assert!(request_line(&pms.heads()[1]).starts_with("GET /interleaved.mp4 "));
+    assert!(pms.heads()[1].contains(&format!("Range: bytes={target}-")));
+    // A failed transport must be redialed even if its old bytes are cached.
+    state.io_failed = true;
+    assert_eq!(seek_cb(op, target, SEEK_SET), target);
+    assert_eq!(pms.requests().len(), 3);
+    crate::aq::aq_abort(&mut *aq);
+    assert_eq!(read_cb(op, buf.as_mut_ptr(), 64), AVERROR_EOF);
+    assert_eq!(seek_cb(op, target, SEEK_SET), -1);
+    assert_eq!(pms.requests().len(), 3);
+    crate::stream::http_close(&mut *hs);
+    crate::aq::aq_destroy(&mut *aq);
+}
+
+#[test]
 fn a_seek_reopen_follows_a_relative_302_and_keeps_its_range() {
     let _serial = crate::testlock::serial();
     let pms = Scripted::start(|head, _port| {
@@ -224,6 +300,7 @@ fn a_seek_reopen_follows_a_relative_302_and_keeps_its_range() {
         acquisition: None,
         bounce: Vec::new(),
         bounce_pos: 0,
+        read_window: None,
     };
     let at = seek_cb(&mut state as *mut AvioState as *mut c_void, 2, SEEK_SET);
     let kept_path = match &state.src {
@@ -402,9 +479,15 @@ fn an_hls_redirect_off_the_pms_origin_is_refused_before_it_is_dialled() {
     let cdn = Scripted::start(|_head, _port| ok_body("ABCD"));
     let cdn_port = cdn.port;
     let pms = Scripted::start(move |_head, _port| {
-        redirect(302, &format!("http://127.0.0.1:{cdn_port}/cdn/v.ts?sig=abc"))
+        redirect(
+            302,
+            &format!("http://127.0.0.1:{cdn_port}/cdn/v.ts?sig=abc"),
+        )
     });
     let (outcome, _hs) = hls_open_plain(pms.port, "/start?X-Plex-Token=tok");
     assert!(outcome.is_err(), "{outcome:?}");
-    assert!(cdn.requests().is_empty(), "nothing may reach another origin");
+    assert!(
+        cdn.requests().is_empty(),
+        "nothing may reach another origin"
+    );
 }
